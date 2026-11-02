@@ -1,3 +1,4 @@
+#include <cstdlib>
 #include "args.h"
 
 #include <iostream>
@@ -179,6 +180,15 @@ std::optional<std::filesystem::path> optional_path_arg(int argc, char ** argv, c
 
 engine::core::BackendType parse_backend(const std::string & value) {
     if (value == "cpu") {
+        return engine::core::BackendType::Cpu;
+    }
+    if (value == "npu") {
+        // The CPU backend, with large matmuls on the AMD XDNA2 NPU (ENGINE_ENABLE_XDNA builds).
+#ifdef _WIN32
+        _putenv_s("GGML_XDNA", "1");
+#else
+        setenv("GGML_XDNA", "1", 0);
+#endif
         return engine::core::BackendType::Cpu;
     }
     if (value == "cuda") {

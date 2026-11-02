@@ -2,20 +2,23 @@
 //
 // The NPU is good at one thing here: C[M x N] = A[M x K] * W[N x K]^T where W is a constant weight
 // matrix. The core program (tools/xdna/gemm_bfp.py, mm_bfp_f32.cc) uses all 32 cores and serves
-// every shape with M a multiple of 64, K of 64 and N of 512; only the instruction stream changes,
-// and that is generated here. Weights and activations go to the NPU as bfp16ebs8: eight values
-// sharing one exponent byte, each with a signed 8-bit mantissa. Sums stay in float32.
+// every shape with M a multiple of 64, K of 64 and N of 512; other shapes are padded with zeros.
+// Only the instruction stream changes with the shape, and that is generated here. Weights and
+// activations go to the NPU as bfp16ebs8: eight values sharing one exponent byte, each with a signed
+// 8-bit mantissa. Sums stay in float32.
 //
 // What costs time is about 70 us per dispatch in the driver and firmware, plus moving the whole of
 // W from memory for each call at up to 50 GB/s; the arithmetic itself is negligible. So a call is
 // worth sending only when K * N is large and M is not tiny.
 //
 // Settings, read once:
-//   GGML_XDNA=1               turn it on
-//   GGML_XDNA_XCLBIN=<file>   the compiled core program
+//   GGML_XDNA=1               turn it on (--backend npu does)
+//   GGML_XDNA_XCLBIN=<file>   the compiled core program (default: xdna/gemm_bfp.xclbin next to the program)
 //   GGML_XDNA_MIN_M=<n>       smallest M sent to the NPU (default 1: the cost estimate decides)
-//   GGML_XDNA_TRACE=1         print where the time went at exit
+//   GGML_XDNA_FORCE=1         send every eligible matmul, whatever it costs (tests)
+//   GGML_XDNA_TRACE=1         print where the time went at exit; a larger n: every n calls as well
 #include "ggml-xdna.h"
+#include "ggml-xdna-insts.h"
 #include "ggml-impl.h"
 #include "ggml-backend.h"
 
@@ -36,7 +39,8 @@
 #include <map>
 #include <memory>
 #include <mutex>
-#include <set>
+#include <sys/resource.h>
+#include <unistd.h>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -47,74 +51,7 @@
 
 namespace {
 
-constexpr int64_t TM = 16, TK = 64, TN = 64, ROWS = 4, COLS = 8;  // tile sizes and core grid of the design
-constexpr int64_t GRAIN_M = TM * ROWS, GRAIN_N = TN * COLS;
-constexpr size_t BLOCK = 9;
-
-// ---- instruction stream ---------------------------------------------------------------------
-// Reproduces what IRON lowers gemm_bfp.py to, word for word (tools/xdna/check_insts.py compares).
-
-// Where the placer put each stream. Fixed by the design, not by the shape.
-constexpr int A_SHIM[ROWS][2] = {{3, 0}, {3, 1}, {2, 0}, {4, 0}};
-constexpr int B_SHIM[COLS][2] = {{0, 0}, {1, 0}, {2, 1}, {4, 1}, {5, 0}, {5, 1}, {6, 0}, {7, 0}};
-constexpr uint32_t ARG_A = 0, ARG_B = 1, ARG_C = 2;
-constexpr uint32_t BD_BASE = 0x1d000, BD_STRIDE = 0x20, S2MM0_CTRL = 0x1d200, S2MM0_QUEUE = 0x1d204;
-constexpr uint32_t MM2S0_QUEUE = 0x1d214, MM2S1_QUEUE = 0x1d21c;
-constexpr uint32_t RTP_NMID = 0x09000, RTP_TILES = 0x09004, BARRIER_LOCK = 0x1f060;
-
-uint32_t tile_addr(int col, int row, uint32_t off) { return ((uint32_t) col << 25) | ((uint32_t) row << 20) | off; }
-
-struct stream {
-    std::vector<uint32_t> w;
-    uint32_t ops = 0;
-    std::set<int> used[COLS];
-
-    void put(std::initializer_list<uint32_t> words) { w.insert(w.end(), words); ops++; }
-    void write32(uint32_t addr, uint32_t v) { put({0, 0, addr, 0, v, 24}); }
-    int bd(int col) { int b = 0; while (used[col].count(b)) b++; used[col].insert(b); return b; }
-    void task(std::vector<std::pair<int, int>> & group, int col, uint32_t arg, uint32_t off, uint32_t words, uint32_t queue, uint32_t repeat, bool drain) {
-        const int b = bd(col);
-        group.push_back({col, b});
-        const uint32_t a = tile_addr(col, 0, BD_BASE + BD_STRIDE * (uint32_t) b);
-        put({1, 0, a, 48, words, off, 0, 0, 0xc0000000, 0x02000000, 0, 0x02000000});
-        put({0x81, 48, 0, 0, 0, 0, a + 4, 0, arg, 0, off, 0});
-        if (drain) put({3, 0, tile_addr(col, 0, S2MM0_CTRL), 0, 0xf00, 0x1f00, 28});
-        write32(tile_addr(col, 0, queue), (drain ? 0x80000000u : 0u) | ((repeat - 1) << 16) | (uint32_t) b);
-    }
-    void wait_all(std::vector<std::pair<int, int>> & group) {
-        for (int c = 0; c < COLS; c++) put({0x80, 16, (uint32_t) c << 16, 0x00010100});
-        for (auto [col, b] : group) used[col].erase(b);
-        group.clear();
-    }
-};
-
-std::vector<uint32_t> make_insts(int64_t M, int64_t K, int64_t N) {
-    stream s;
-    const int64_t nk = K / TK, per_col = N / TN / COLS, rbs = M / TM / ROWS;
-    for (int row = 2; row < 2 + ROWS; row++)
-        for (int col = 0; col < COLS; col++) {
-            s.write32(tile_addr(col, row, RTP_NMID), (uint32_t) (nk - 1));
-            s.write32(tile_addr(col, row, RTP_TILES), (uint32_t) ((M / TM) * (N / TN) / (ROWS * COLS)));
-            s.write32(tile_addr(col, row, BARRIER_LOCK), 1);
-        }
-    const int64_t a_row = TM * K / 8, b_col = (N / COLS) * K / 8, c_rb = per_col * ROWS * TM * TN;
-    std::vector<std::vector<std::pair<int, int>>> groups(rbs);
-    for (int64_t rb = 0; rb < rbs; rb++) {
-        if (rb >= 4) s.wait_all(groups[rb - 4]);
-        for (int c = 0; c < COLS; c++) {
-            s.task(groups[rb], c, ARG_C, (uint32_t) ((c * rbs + rb) * c_rb * 4), (uint32_t) c_rb, S2MM0_QUEUE, 1, true);
-            if (c < ROWS)
-                s.task(groups[rb], A_SHIM[c][0], ARG_A, (uint32_t) ((rb * ROWS + c) * a_row * BLOCK), (uint32_t) (a_row * BLOCK / 4),
-                       A_SHIM[c][1] ? MM2S1_QUEUE : MM2S0_QUEUE, (uint32_t) per_col, false);
-            s.task(groups[rb], B_SHIM[c][0], ARG_B, (uint32_t) (c * b_col * BLOCK), (uint32_t) (b_col * BLOCK / 4),
-                   B_SHIM[c][1] ? MM2S1_QUEUE : MM2S0_QUEUE, 1, false);
-        }
-    }
-    for (int64_t rb = std::max<int64_t>(0, rbs - 4); rb < rbs; rb++) s.wait_all(groups[rb]);
-    std::vector<uint32_t> out = {0x06040100, 0x108, s.ops, (uint32_t) ((s.w.size() + 4) * 4)};
-    out.insert(out.end(), s.w.begin(), s.w.end());
-    return out;
-}
+using namespace ggml_xdna;
 
 // ---- operands -------------------------------------------------------------------------------
 
@@ -146,17 +83,32 @@ inline int64_t tiled(int64_t first_tile, int64_t rr, int64_t cb, int64_t tile_ro
     return (first_tile * nk + cb / tkb) * tile + (rr / 16) * tkb * 16 + (cb % tkb) * 16 + rr % 16;
 }
 
-void pack_a(const float * x, int64_t rows, int64_t M, int64_t K, uint8_t * o) {
-    const int64_t nk = K / TK;
-    memset(o, 0, (size_t) (M * K / 8 * BLOCK));
-    for (int64_t r = 0; r < rows; r++)
-        for (int64_t cb = 0; cb < K / 8; cb++)
-            encode_block(x + r * K + cb * 8, o + BLOCK * tiled(r / TM, r % TM, cb, TM, nk));
+inline int64_t up_to(int64_t v, int64_t grain) { return (v + grain - 1) / grain * grain; }
+inline int64_t pad_k(int64_t K) { return std::max(up_to(K, TK), 2 * TK); }
+
+// One row of K values into its blocks; past K the operand stays zero. Kp is K padded for the design.
+template <typename Where>
+inline void encode_row(const float * x, int64_t K, uint8_t * o, Where && where) {
+    const int64_t whole = K / 8;
+    for (int64_t cb = 0; cb < whole; cb++) encode_block(x + cb * 8, o + BLOCK * where(cb));
+    if (K % 8) {
+        float last[8] = {0};
+        memcpy(last, x + whole * 8, (K % 8) * sizeof(float));
+        encode_block(last, o + BLOCK * where(whole));
+    }
 }
 
-void pack_w(const ggml_tensor * w, int64_t N, int64_t K, uint8_t * o) {
-    const int64_t nk = K / TK, per_col = N / TN / COLS;
+void pack_a(const float * x, int64_t rows, int64_t M, int64_t K, int64_t Kp, uint8_t * o) {
+    const int64_t nk = Kp / TK;
+    memset(o, 0, (size_t) (M * Kp / 8 * BLOCK));
+    for (int64_t r = 0; r < rows; r++)
+        encode_row(x + r * K, K, o, [&](int64_t cb) { return tiled(r / TM, r % TM, cb, TM, nk); });
+}
+
+void pack_w(const ggml_tensor * w, int64_t N, int64_t K, int64_t Np, int64_t Kp, uint8_t * o) {
+    const int64_t nk = Kp / TK, per_col = Np / TN / COLS;
     const auto * traits = ggml_get_type_traits(w->type);
+    memset(o, 0, (size_t) (Np * Kp / 8 * BLOCK));
     const auto part = [&](int64_t from, int64_t to) {
         std::vector<float> row(K);
         for (int64_t j = from; j < to; j++) {
@@ -164,8 +116,7 @@ void pack_w(const ggml_tensor * w, int64_t N, int64_t K, uint8_t * o) {
             if (w->type == GGML_TYPE_F32) memcpy(row.data(), p, K * sizeof(float));
             else traits->to_float(p, row.data(), K);
             const int64_t g = j / TN, first = (g % COLS) * per_col + g / COLS;
-            for (int64_t cb = 0; cb < K / 8; cb++)
-                encode_block(row.data() + cb * 8, o + BLOCK * tiled(first, j % TN, cb, TN, nk));
+            encode_row(row.data(), K, o, [&](int64_t cb) { return tiled(first, j % TN, cb, TN, nk); });
         }
     };
     constexpr int64_t THREADS = 8;
@@ -175,19 +126,42 @@ void pack_w(const ggml_tensor * w, int64_t N, int64_t K, uint8_t * o) {
     for (auto & t : team) t.join();
 }
 
-// The real rows of the output, out of the core tiles.
-void unpack_c(const float * c, int64_t rows, int64_t M, int64_t N, float * dst) {
-    const int64_t per_col = N / TN / COLS, rbs = M / TM / ROWS, c_rb = per_col * ROWS * TM * TN;
-    for (int64_t r = 0; r < rows; r++) {
-        const int64_t rb = r / (ROWS * TM), core = (r / TM) % ROWS, rr = r % TM;
-        float * out = dst + r * N;
-        for (int col = 0; col < COLS; col++)
+// The real rows and columns of the output, out of the core tiles. Walks the tiles in the order they lie
+// in memory, which has just been invalidated, so that the prefetcher does the work.
+void unpack_c(const float * c, int64_t rows, int64_t M, int64_t N, int64_t Np, float * dst) {
+    const int64_t per_col = Np / TN / COLS, rbs = M / TM / ROWS, c_rb = per_col * ROWS * TM * TN;
+    const int64_t tile_floats = TM * TN, blocks_n = TN / 8;
+    const int64_t used_cores_total = (rows + TM - 1) / TM;  // core rows that hold real output, over all row blocks
+    for (int col = 0; col < COLS; col++) {
+        for (int64_t rb = 0; rb < rbs; rb++) {
+            const int64_t first_row = rb * ROWS * TM;
+            if (first_row >= rows) break;
             for (int64_t t = 0; t < per_col; t++) {
-                const float * tile = c + (col * rbs + rb) * c_rb + t * (ROWS * TM * TN) + core * (TM * TN);
                 const int64_t at = (col + COLS * t) * TN;
-                for (int64_t jb = 0; jb < TN / 8; jb++)
-                    memcpy(out + at + jb * 8, tile + ((rr / 8) * (TN / 8) + jb) * 64 + (rr % 8) * 8, 8 * sizeof(float));
+                if (at >= N) continue;
+                const float * group = c + (col * rbs + rb) * c_rb + t * (ROWS * tile_floats);
+                for (int64_t core = 0; core < ROWS && rb * ROWS + core < used_cores_total; core++) {
+                    const float * tile = group + core * tile_floats;
+                    const int64_t tile_row = first_row + core * TM;
+                    for (int64_t z = 0; z < TM / 8; z++) {
+                        for (int64_t jb = 0; jb < blocks_n; jb++) {
+                            const float * block = tile + (z * blocks_n + jb) * 64;
+                            const int64_t col0 = at + jb * 8;
+                            if (col0 >= N) break;
+                            const int64_t row0 = tile_row + z * 8;
+                            const int64_t nrows = std::min<int64_t>(8, rows - row0);
+                            if (col0 + 8 <= N) {
+                                for (int64_t i = 0; i < nrows; i++)
+                                    _mm256_storeu_ps(dst + (row0 + i) * N + col0, _mm256_loadu_ps(block + i * 8));
+                            } else {
+                                for (int64_t i = 0; i < nrows; i++)
+                                    memcpy(dst + (row0 + i) * N + col0, block + i * 8, (N - col0) * sizeof(float));
+                            }
+                        }
+                    }
+                }
             }
+        }
     }
 }
 
@@ -210,10 +184,15 @@ struct npu {
     size_t a_cap = 0, c_cap = 0;
     std::mutex mu;
     // accounting
+    long long trace_every = 0;
     long long calls = 0;
     double us_pack = 0, us_run = 0, us_unpack = 0, us_w = 0, macs = 0;
     size_t w_bytes = 0;
 
+    void print_trace() const {
+        fprintf(stderr, "xdna: %lld calls, %.1f GMAC; pack %.0f ms, run %.0f ms, unpack %.0f ms; weights %.1f MB packed in %.0f ms; %zu shapes\n",
+                calls, macs / 1e9, us_pack / 1e3, us_run / 1e3, us_unpack / 1e3, w_bytes / 1e6, us_w / 1e3, shapes.size());
+    }
     static xrt::hw_context open(xrt::device & d, xrt::xclbin & x) {
         d.register_xclbin(x);
         return xrt::hw_context(d, x.get_uuid());
@@ -233,7 +212,7 @@ struct npu {
         s.bo.sync(XCL_BO_SYNC_BO_TO_DEVICE);
         return shapes.emplace(key, std::move(s)).first->second;
     }
-    weight & get_weight(const ggml_tensor * w, int64_t N, int64_t K) {
+    weight & get_weight(const ggml_tensor * w, int64_t N, int64_t K, int64_t Np, int64_t Kp) {
         // the content tells a reloaded model apart from the one that used to sit at this address
         uint64_t sum = 14695981039346656037ULL;
         const size_t n = ggml_nbytes(w);
@@ -246,11 +225,11 @@ struct npu {
         auto it = weights.find(w->data);
         if (it != weights.end() && it->second.sum == sum) return it->second;
         const auto t = clk::now();
-        const size_t bytes = (size_t) (N * K / 8 * BLOCK);
+        const size_t bytes = (size_t) (Np * Kp / 8 * BLOCK);
         weight x;
         x.sum = sum;
         x.bo = xrt::bo(dev, bytes, XRT_BO_FLAGS_HOST_ONLY, kern.group_id(4));
-        pack_w(w, N, K, x.bo.map<uint8_t *>());
+        pack_w(w, N, K, Np, Kp, x.bo.map<uint8_t *>());
         x.bo.sync(XCL_BO_SYNC_BO_TO_DEVICE);
         us_w += us_since(t);
         w_bytes += bytes;
@@ -259,15 +238,15 @@ struct npu {
         return slot;
     }
     void mul_mat(const ggml_tensor * w, const float * x, float * out, int64_t rows, int64_t K, int64_t N) {
-        const int64_t M = (rows + GRAIN_M - 1) / GRAIN_M * GRAIN_M;
+        const int64_t M = up_to(rows, GRAIN_M), Kp = pad_k(K), Np = up_to(N, GRAIN_N);
         std::lock_guard<std::mutex> lock(mu);
-        const size_t an = (size_t) (M * K / 8 * BLOCK), cn = (size_t) (M * N) * sizeof(float);
+        const size_t an = (size_t) (M * Kp / 8 * BLOCK), cn = (size_t) (M * Np) * sizeof(float);
         if (an > a_cap) { a = xrt::bo(dev, an, XRT_BO_FLAGS_HOST_ONLY, kern.group_id(3)); a_cap = an; }
         if (cn > c_cap) { c = xrt::bo(dev, cn, XRT_BO_FLAGS_HOST_ONLY, kern.group_id(5)); c_cap = cn; }
-        shape & s = get_shape(M, K, N);
-        weight & wb = get_weight(w, N, K);
+        shape & s = get_shape(M, Kp, Np);
+        weight & wb = get_weight(w, N, K, Np, Kp);
         auto t = clk::now();
-        pack_a(x, rows, M, K, a.map<uint8_t *>());
+        pack_a(x, rows, M, K, Kp, a.map<uint8_t *>());
         a.sync(XCL_BO_SYNC_BO_TO_DEVICE, an, 0);
         us_pack += us_since(t);
         t = clk::now();
@@ -284,10 +263,11 @@ struct npu {
         t = clk::now();
         c.sync(XCL_BO_SYNC_BO_FROM_DEVICE, cn, 0);
         _mm_mfence();
-        unpack_c(c.map<const float *>(), rows, M, N, out);
+        unpack_c(c.map<const float *>(), rows, M, N, Np, out);
         us_unpack += us_since(t);
         calls++;
         macs += (double) rows * K * N;
+        if (trace_every > 0 && calls % trace_every == 0) print_trace();
     }
 };
 
@@ -295,29 +275,40 @@ std::once_flag g_once;
 npu * g_npu = nullptr;
 bool g_on = false;
 int64_t g_min_m = 1;
+bool g_force = false;
 
 void trace_at_exit() {
-    if (!g_npu) return;
-    npu & n = *g_npu;
-    fprintf(stderr, "xdna: %lld calls, %.1f GMAC; pack %.0f ms, run %.0f ms, unpack %.0f ms; weights %.1f MB packed in %.0f ms; %zu shapes\n",
-            n.calls, n.macs / 1e9, n.us_pack / 1e3, n.us_run / 1e3, n.us_unpack / 1e3, n.w_bytes / 1e6, n.us_w / 1e3, n.shapes.size());
+    if (g_npu) g_npu->print_trace();
 }
 
 void init() {
     const char * on = getenv("GGML_XDNA");
     if (!on || !*on || !strcmp(on, "0")) return;
     if (const char * v = getenv("GGML_XDNA_MIN_M")) g_min_m = atoll(v);
-    const char * path = getenv("GGML_XDNA_XCLBIN");
-    if (!path || !*path) {
-        fprintf(stderr, "xdna: GGML_XDNA_XCLBIN is not set; staying on the CPU\n");
-        return;
+    g_force = getenv("GGML_XDNA_FORCE") != nullptr;
+    std::string path;
+    if (const char * v = getenv("GGML_XDNA_XCLBIN")) path = v;
+    if (path.empty()) {
+        // next to the program, in xdna/
+        char exe[4096];
+        const ssize_t n = readlink("/proc/self/exe", exe, sizeof(exe) - 1);
+        if (n > 0) {
+            path.assign(exe, (size_t) n);
+            path = path.substr(0, path.rfind('/')) + "/xdna/gemm_bfp.xclbin";
+        }
     }
+#ifdef GGML_XDNA_XRT_ROOT_DIR
+    setenv("XILINX_XRT", GGML_XDNA_XRT_ROOT_DIR, 0);  // XRT finds its plugins through this
+#endif
     try {
         const auto t = clk::now();
         g_npu = new npu(path);  // never freed: the driver cleans up when the process ends
         g_on = true;
         fprintf(stderr, "xdna: NPU %s ready in %.0f ms\n", g_npu->dev.get_info<xrt::info::device::name>().c_str(), us_since(t) / 1e3);
-        if (getenv("GGML_XDNA_TRACE")) atexit(trace_at_exit);
+        if (const char * v = getenv("GGML_XDNA_TRACE")) {
+            atexit(trace_at_exit);
+            if (atoll(v) > 1) g_npu->trace_every = atoll(v);  // also every so many calls, for a server
+        }
     } catch (const std::exception & e) {
         fprintf(stderr, "xdna: no NPU, staying on the CPU: %s\n", e.what());
     }
@@ -349,17 +340,20 @@ extern "C" bool ggml_xdna_owns(const struct ggml_tensor * dst, int nth) {
     const ggml_tensor * x = dst->src[1];
     const int64_t K = w->ne[0], N = w->ne[1];
     if (w->ne[2] != 1 || w->ne[3] != 1 || x->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32) return false;
-    if (K < 2 * TK || K % TK != 0 || N < GRAIN_N || N % GRAIN_N != 0) return false;
     // Weights only: a constant the NPU can keep a copy of.
-    if (!ggml_is_quantized(w->type)) return false;
-    if (!ggml_is_contiguous(x) || !ggml_is_contiguous(dst)) return false;
+    const bool is_weights = w->buffer != nullptr && ggml_backend_buffer_get_usage(w->buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS;
+    if (!is_weights && !ggml_is_quantized(w->type)) return false;
+    if (!ggml_is_quantized(w->type) && w->type != GGML_TYPE_F32 && w->type != GGML_TYPE_F16) return false;
+    if (w->nb[0] != ggml_type_size(w->type) || !ggml_is_contiguous(x) || !ggml_is_contiguous(dst)) return false;
     const int64_t rows = x->ne[1] * x->ne[2] * x->ne[3];
-    if (rows < g_min_m || rows > 1024) return false;
-    // Measured on Strix Halo. The NPU: a dispatch, then W at 47 GB/s, then A and C on the host. The CPU
-    // on 8-bit weights: about 25 GMAC/s a thread, up to what memory gives, about 100 GMAC/s together.
-    const double npu_us = 75.0 + (double) K * N * BLOCK / 8 / 47e3 + 2e-3 * rows * (K + N);
+    if (rows < g_min_m || rows > 4096) return false;
+    // Measured on Strix Halo. The NPU: a dispatch, then W at 47 GB/s for every 64 rows, then A and C on
+    // the host. The CPU on 8-bit weights: about 25 GMAC/s a thread, up to what memory gives, about
+    // 100 GMAC/s together.
+    const int64_t Kp = pad_k(K), Np = up_to(N, GRAIN_N), row_blocks = up_to(rows, GRAIN_M) / GRAIN_M;
+    const double npu_us = 75.0 + (double) row_blocks * Kp * Np * BLOCK / 8 / 47e3 + 2e-3 * rows * (Kp + Np);
     const double cpu_us = (double) rows * K * N / std::min(25e3 * nth, 100e3);
-    return npu_us < cpu_us;
+    return g_force || npu_us < cpu_us;
 }
 
 extern "C" void ggml_xdna_mul_mat(struct ggml_tensor * dst) {

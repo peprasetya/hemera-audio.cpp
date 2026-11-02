@@ -101,7 +101,7 @@ void print_help() {
         << "                                   AUDIOCPP_BUILD_NATIVE_MODEL_MANAGER=ON at build time\n"
         << "  --host <ip>                      server bind address; default 127.0.0.1\n"
         << "  --port <port>                    server listening port; default 8080\n"
-        << "  --backend cpu|cuda|hip|rocm|vulkan|metal  default cuda (rocm is an alias for hip)\n"
+        << "  --backend cpu|npu|cuda|hip|rocm|vulkan|metal  default cuda (rocm is an alias for hip; npu is cpu with matmuls on an AMD XDNA2 NPU)\n"
         << "  --list-devices                   list available backend devices and exit\n"
         << "  --busy-timeout-ms <ms>           fail a request with 503 when the model has been\n"
         << "                                   busy this long; default 300000, 0 disables\n"
