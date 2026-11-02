@@ -399,6 +399,14 @@ core::TensorValue zeros_like_prefix(core::ModuleBuildContext &ctx,
   if (frames <= 0) {
     return {};
   }
+  if (ctx.backend_type == core::BackendType::Cpu) {
+    const auto shape = core::TensorShape::from_dims(
+        {input.shape.dims[0], input.shape.dims[1], frames});
+    const auto dims = core::to_ggml_dims(shape);
+    auto *zeros = ggml_new_tensor_4d(ctx.ggml, GGML_TYPE_F32, dims[0], dims[1],
+                                     dims[2], dims[3]);
+    return core::wrap_tensor(ggml_fill(ctx.ggml, zeros, 0.0F), shape, GGML_TYPE_F32);
+  }
   auto prefix =
       modules::RepeatModule(
           {core::TensorShape::from_dims(

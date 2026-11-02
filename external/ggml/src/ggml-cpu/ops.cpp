@@ -1,3 +1,8 @@
+#include "ggml-backend.h"
+#include <vector>
+#include <atomic>
+#include <mutex>
+#include <map>
 #include "ops.h"
 
 #include "ggml-cpu.h"
@@ -1712,10 +1717,6 @@ static void ggml_compute_forward_repeat_f32(
 
     const ggml_tensor * src0 = dst->src[0];
 
-    if (params->ith != 0) {
-        return;
-    }
-
     GGML_ASSERT(ggml_can_repeat(src0, dst));
 
     GGML_TENSOR_UNARY_OP_LOCALS
@@ -1725,6 +1726,25 @@ static void ggml_compute_forward_repeat_f32(
     const int nr1 = (int)(ne1/ne01);
     const int nr2 = (int)(ne2/ne02);
     const int nr3 = (int)(ne3/ne03);
+
+    // One value per channel spread along the time axis, as convolution biases are: fill each row,
+    // on every thread, instead of copying one float at a time on one.
+    if (ne00 == 1 && nr1 == 1 && nr2 == 1 && nr3 == 1 && nb0 == sizeof(float)) {
+        const int64_t rows = ne1*ne2*ne3;
+        for (int64_t r = rows*params->ith/params->nth; r < rows*(params->ith + 1)/params->nth; r++) {
+            const int64_t i1 = r % ne1, i2 = (r / ne1) % ne2, i3 = r / (ne1*ne2);
+            const float v = *(const float *) ((const char *) src0->data + i1*nb01 + i2*nb02 + i3*nb03);
+            float * out = (float *) ((char *) dst->data + i1*nb1 + i2*nb2 + i3*nb3);
+            for (int64_t i0 = 0; i0 < ne0; i0++) {
+                out[i0] = v;
+            }
+        }
+        return;
+    }
+
+    if (params->ith != 0) {
+        return;
+    }
 
     // TODO: support for transposed / permuted tensors
     GGML_ASSERT(nb0  == sizeof(float));
@@ -6166,6 +6186,44 @@ static void ggml_compute_forward_conv_transpose_1d_f16_f32(
     }
 }
 
+// The kernel of a transposed convolution in the layout its loop wants, Cin x K x Cout. For weights,
+// which never change, it is made once and kept: redoing it takes longer than the convolution itself
+// in the large layers. Null when src0 is not a weight tensor. Thread 0 only.
+static const float * ggml_conv_transpose_1d_kept_kernel(const ggml_tensor * src0) {
+    if (src0->buffer == nullptr || ggml_backend_buffer_get_usage(src0->buffer) != GGML_BACKEND_BUFFER_USAGE_WEIGHTS ||
+            ggml_nbytes(src0) < 1 << 16) {
+        return nullptr;
+    }
+    // the content tells a reloaded model apart from the one that used to sit at this address
+    uint64_t sum = 14695981039346656037ULL;
+    const size_t n = ggml_nbytes(src0);
+    const uint8_t * bytes = (const uint8_t *) src0->data;
+    for (size_t i = 0; i < 64; i++) {
+        sum = (sum ^ bytes[i]) * 1099511628211ULL;
+        sum = (sum ^ bytes[n / 2 + i]) * 1099511628211ULL;
+        sum = (sum ^ bytes[n - 1 - i]) * 1099511628211ULL;
+    }
+    struct kept { uint64_t sum; std::vector<float> data; };
+    static std::mutex mu;
+    static std::map<const void *, kept> cache;
+    std::lock_guard<std::mutex> lock(mu);
+    kept & k = cache[src0->data];
+    if (k.sum != sum || k.data.size() != n / sizeof(float)) {
+        k.sum = sum;
+        k.data.resize(n / sizeof(float));
+        for (int64_t i02 = 0; i02 < src0->ne[2]; i02++) {
+            for (int64_t i01 = 0; i01 < src0->ne[1]; i01++) {
+                const float * const in = (const float *) ((const char *) src0->data + i02 * src0->nb[2] + i01 * src0->nb[1]);
+                float * out = k.data.data() + i01 * src0->ne[0] * src0->ne[2];
+                for (int64_t i00 = 0; i00 < src0->ne[0]; i00++) {
+                    out[i00 * src0->ne[2] + i02] = in[i00];
+                }
+            }
+        }
+    }
+    return k.data.data();
+}
+
 static void ggml_compute_forward_conv_transpose_1d_f32(
         const ggml_compute_params * params,
               ggml_tensor * dst) {
@@ -6187,11 +6245,15 @@ static void ggml_compute_forward_conv_transpose_1d_f32(
     GGML_ASSERT(nb00 == sizeof(float));
     GGML_ASSERT(nb10 == sizeof(float));
 
+    // shared with the team through the threadpool barrier below
+    static std::atomic<const float *> kept_kernel{nullptr};
+
     if (ith == 0) {
-        memset(params->wdata, 0, params->wsize);
+        const float * kept = ggml_conv_transpose_1d_kept_kernel(src0);
+        kept_kernel.store(kept, std::memory_order_relaxed);
 
         // prepare kernel data (src0) from (K x Cout x Cin) to (Cin x K x Cout)
-        {
+        if (kept == nullptr) {
             float * const wdata = (float *) params->wdata + 0;
 
             for (int64_t i02 = 0; i02 < ne02; i02++) {
@@ -6235,12 +6297,13 @@ static void ggml_compute_forward_conv_transpose_1d_f32(
     const int ir0 = dr*ith;
     const int ir1 = MIN(ir0 + dr, nr);
 
-    float * const wdata     = (float *) params->wdata + 0;
-    float * const wdata_src = wdata + nk;
+    const float * kept = kept_kernel.load(std::memory_order_relaxed);
+    const float * const wdata     = kept != nullptr ? kept : (const float *) params->wdata + 0;
+    const float * const wdata_src = (const float *) params->wdata + nk;
 
     for (int i1 = ir0; i1 < ir1; i1++) {
         float * dst_data = (float *)((char *) dst->data + i1*nb1);
-        float * wdata_kernel = wdata + i1*ne02*ne00;
+        const float * wdata_kernel = wdata + i1*ne02*ne00;
         for (int i10 = 0; i10 < ne10; i10++) {
             const int i1n = i10*ne11;
             for (int i00 = 0; i00 < ne00; i00++) {

@@ -10,8 +10,8 @@
 extern "C" {
 #endif
 
-// Whether the NPU computes this matmul. The answer is the same on every thread of the team.
-bool ggml_xdna_owns(const struct ggml_tensor * dst);
+// Whether the NPU computes this matmul, in a team of nth threads. Same answer on every thread.
+bool ggml_xdna_owns(const struct ggml_tensor * dst, int nth);
 
 // Computes a matmul that ggml_xdna_owns said yes to.
 void ggml_xdna_mul_mat(struct ggml_tensor * dst);

@@ -1256,7 +1256,7 @@ void ggml_compute_forward_mul_mat(
               struct ggml_tensor * dst) {
 
 #ifdef GGML_USE_XDNA
-    if (ggml_xdna_owns(dst)) {
+    if (ggml_xdna_owns(dst, params->nth)) {
         ggml_xdna_mul_mat(dst);
         return;
     }
@@ -3237,9 +3237,9 @@ static void ggml_opprof_add(const struct ggml_tensor * node, double ms) {
 // Nodes too small to be worth a barrier. Only ops whose compute function has no barrier of its own.
 static int ggml_cpu_serial_elements = -1;
 
-static bool ggml_cpu_node_is_serial(const struct ggml_tensor * node) {
+static bool ggml_cpu_node_is_serial(const struct ggml_tensor * node, int nth) {
 #ifdef GGML_USE_XDNA
-    if (node->op == GGML_OP_MUL_MAT && ggml_xdna_owns(node)) {
+    if (node->op == GGML_OP_MUL_MAT && ggml_xdna_owns(node, nth)) {
         return true;
     }
 #endif
@@ -3311,7 +3311,7 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
 
         // A small node, or one the NPU computes, is thread 0's alone. The others skip it and meet thread 0
         // at the next node that does run in parallel, so a run of these costs no barriers at all.
-        if (params.nth > 1 && ggml_cpu_node_is_serial(node)) {
+        if (ggml_cpu_node_is_serial(node, params.nth)) {
             if (state->ith == 0) {
                 struct ggml_compute_params serial = params;
                 serial.nth = 1;

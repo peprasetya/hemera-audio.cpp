@@ -13,10 +13,11 @@
 // Settings, read once:
 //   GGML_XDNA=1               turn it on
 //   GGML_XDNA_XCLBIN=<file>   the compiled core program
-//   GGML_XDNA_MIN_M=<n>       smallest M sent to the NPU (default 8)
+//   GGML_XDNA_MIN_M=<n>       smallest M sent to the NPU (default 1: the cost estimate decides)
 //   GGML_XDNA_TRACE=1         print where the time went at exit
 #include "ggml-xdna.h"
 #include "ggml-impl.h"
+#include "ggml-backend.h"
 
 #include <xrt/xrt_bo.h>
 #include <xrt/xrt_device.h>
@@ -38,6 +39,7 @@
 #include <set>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <tuple>
 #include <unordered_map>
 #include <utility>
@@ -154,16 +156,23 @@ void pack_a(const float * x, int64_t rows, int64_t M, int64_t K, uint8_t * o) {
 
 void pack_w(const ggml_tensor * w, int64_t N, int64_t K, uint8_t * o) {
     const int64_t nk = K / TK, per_col = N / TN / COLS;
-    std::vector<float> row(K);
     const auto * traits = ggml_get_type_traits(w->type);
-    for (int64_t j = 0; j < N; j++) {
-        const char * p = (const char *) w->data + j * w->nb[1];
-        if (w->type == GGML_TYPE_F32) memcpy(row.data(), p, K * sizeof(float));
-        else traits->to_float(p, row.data(), K);
-        const int64_t g = j / TN, first = (g % COLS) * per_col + g / COLS;
-        for (int64_t cb = 0; cb < K / 8; cb++)
-            encode_block(row.data() + cb * 8, o + BLOCK * tiled(first, j % TN, cb, TN, nk));
-    }
+    const auto part = [&](int64_t from, int64_t to) {
+        std::vector<float> row(K);
+        for (int64_t j = from; j < to; j++) {
+            const char * p = (const char *) w->data + j * w->nb[1];
+            if (w->type == GGML_TYPE_F32) memcpy(row.data(), p, K * sizeof(float));
+            else traits->to_float(p, row.data(), K);
+            const int64_t g = j / TN, first = (g % COLS) * per_col + g / COLS;
+            for (int64_t cb = 0; cb < K / 8; cb++)
+                encode_block(row.data() + cb * 8, o + BLOCK * tiled(first, j % TN, cb, TN, nk));
+        }
+    };
+    constexpr int64_t THREADS = 8;
+    std::vector<std::thread> team;
+    for (int64_t t = 1; t < THREADS; t++) team.emplace_back(part, N * t / THREADS, N * (t + 1) / THREADS);
+    part(0, N / THREADS);
+    for (auto & t : team) t.join();
 }
 
 // The real rows of the output, out of the core tiles.
@@ -194,7 +203,7 @@ struct npu {
     xrt::kernel kern;
     xrt::run run;
     struct shape { xrt::bo bo; unsigned words = 0; };
-    struct weight { xrt::bo bo; };
+    struct weight { xrt::bo bo; uint64_t sum = 0; };
     std::map<std::tuple<int64_t, int64_t, int64_t>, shape> shapes;
     std::unordered_map<const void *, weight> weights;
     xrt::bo a, c;
@@ -225,17 +234,29 @@ struct npu {
         return shapes.emplace(key, std::move(s)).first->second;
     }
     weight & get_weight(const ggml_tensor * w, int64_t N, int64_t K) {
+        // the content tells a reloaded model apart from the one that used to sit at this address
+        uint64_t sum = 14695981039346656037ULL;
+        const size_t n = ggml_nbytes(w);
+        const uint8_t * b = (const uint8_t *) w->data;
+        for (size_t i = 0; i < 32; i++) {
+            sum = (sum ^ b[i]) * 1099511628211ULL;
+            sum = (sum ^ b[n / 2 + i]) * 1099511628211ULL;
+            sum = (sum ^ b[n - 1 - i]) * 1099511628211ULL;
+        }
         auto it = weights.find(w->data);
-        if (it != weights.end()) return it->second;
+        if (it != weights.end() && it->second.sum == sum) return it->second;
         const auto t = clk::now();
         const size_t bytes = (size_t) (N * K / 8 * BLOCK);
         weight x;
+        x.sum = sum;
         x.bo = xrt::bo(dev, bytes, XRT_BO_FLAGS_HOST_ONLY, kern.group_id(4));
         pack_w(w, N, K, x.bo.map<uint8_t *>());
         x.bo.sync(XCL_BO_SYNC_BO_TO_DEVICE);
         us_w += us_since(t);
         w_bytes += bytes;
-        return weights.emplace(w->data, std::move(x)).first->second;
+        weight & slot = weights[w->data];
+        slot = std::move(x);
+        return slot;
     }
     void mul_mat(const ggml_tensor * w, const float * x, float * out, int64_t rows, int64_t K, int64_t N) {
         const int64_t M = (rows + GRAIN_M - 1) / GRAIN_M * GRAIN_M;
@@ -273,7 +294,7 @@ struct npu {
 std::once_flag g_once;
 npu * g_npu = nullptr;
 bool g_on = false;
-int64_t g_min_m = 8;
+int64_t g_min_m = 1;
 
 void trace_at_exit() {
     if (!g_npu) return;
@@ -321,7 +342,7 @@ void mul_mat_fallback(const ggml_tensor * w, const float * x, float * out, int64
 
 }  // namespace
 
-extern "C" bool ggml_xdna_owns(const struct ggml_tensor * dst) {
+extern "C" bool ggml_xdna_owns(const struct ggml_tensor * dst, int nth) {
     std::call_once(g_once, init);
     if (!g_on) return false;
     const ggml_tensor * w = dst->src[0];
@@ -333,7 +354,12 @@ extern "C" bool ggml_xdna_owns(const struct ggml_tensor * dst) {
     if (!ggml_is_quantized(w->type)) return false;
     if (!ggml_is_contiguous(x) || !ggml_is_contiguous(dst)) return false;
     const int64_t rows = x->ne[1] * x->ne[2] * x->ne[3];
-    return rows >= g_min_m && rows <= 1024;
+    if (rows < g_min_m || rows > 1024) return false;
+    // Measured on Strix Halo. The NPU: a dispatch, then W at 47 GB/s, then A and C on the host. The CPU
+    // on 8-bit weights: about 25 GMAC/s a thread, up to what memory gives, about 100 GMAC/s together.
+    const double npu_us = 75.0 + (double) K * N * BLOCK / 8 / 47e3 + 2e-3 * rows * (K + N);
+    const double cpu_us = (double) rows * K * N / std::min(25e3 * nth, 100e3);
+    return npu_us < cpu_us;
 }
 
 extern "C" void ggml_xdna_mul_mat(struct ggml_tensor * dst) {
