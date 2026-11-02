@@ -56,6 +56,9 @@ struct ModuleBuildContext {
     // Preserve logical shapes while omitting physical identity views. Opt-in:
     // removing those views can enable backend fusion and change rounding.
     bool elide_identity_reshapes = false;
+    // CPU only: multi-head attention with fewer key/value heads than query heads multiplies through
+    // ggml_mul_mat's batch broadcast. Same numbers, without building full-size copies of the shared heads.
+    bool broadcast_kv_heads = false;
 };
 
 enum class PortKind {

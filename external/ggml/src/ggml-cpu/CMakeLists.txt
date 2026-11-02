@@ -57,6 +57,13 @@ function(ggml_add_cpu_backend_variant_impl tag_name)
     target_compile_features(${GGML_CPU_NAME} PRIVATE c_std_11 cxx_std_17)
     target_include_directories(${GGML_CPU_NAME} PRIVATE . ggml-cpu)
 
+    if (GGML_XDNA)
+        list(APPEND GGML_CPU_SOURCES ggml-cpu/xdna/ggml-xdna.cpp ggml-cpu/xdna/ggml-xdna.h)
+        target_compile_definitions(${GGML_CPU_NAME} PRIVATE GGML_USE_XDNA)
+        target_include_directories(${GGML_CPU_NAME} PRIVATE ${GGML_XDNA_XRT_ROOT}/include)
+        target_link_libraries(${GGML_CPU_NAME} PRIVATE ${GGML_XDNA_XRT_ROOT}/lib/x86_64-linux-gnu/libxrt_coreutil.so)
+    endif()
+
     if (APPLE AND GGML_ACCELERATE)
         find_library(ACCELERATE_FRAMEWORK Accelerate)
         if (ACCELERATE_FRAMEWORK)

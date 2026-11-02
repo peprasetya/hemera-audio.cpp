@@ -15,6 +15,9 @@
 
 #include <ggml-backend.h>
 #include <ggml.h>
+#include <ggml-cpu.h>
+
+#include <cstdlib>
 
 #include <algorithm>
 #include <cmath>
@@ -767,6 +770,7 @@ private:
           "failed to initialize VoxCPM2 prompt prefill graph context");
     }
     engine::core::ModuleBuildContext ctx{ctx_.get(), "voxcpm2.prompt_prefill"};
+    ctx.broadcast_kv_heads = ggml_backend_is_cpu(weights_->backend()) && getenv("VOXCPM2_NO_KV_BROADCAST") == nullptr;
     auto input_embeddings = engine::core::make_tensor(
         ctx, GGML_TYPE_F32,
         engine::core::TensorShape::from_dims(

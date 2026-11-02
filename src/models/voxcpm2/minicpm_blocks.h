@@ -52,7 +52,7 @@ engine::core::TensorValue reshape_heads(engine::core::ModuleBuildContext &ctx,
 engine::core::TensorValue
 repeat_kv_heads(engine::core::ModuleBuildContext &ctx,
                 const engine::core::TensorValue &input, int64_t repeats) {
-  if (repeats == 1) {
+  if (repeats == 1 || ctx.broadcast_kv_heads) {
     return input;
   }
   std::vector<engine::core::TensorValue> heads;
@@ -111,10 +111,24 @@ attention_from_heads(engine::core::ModuleBuildContext &ctx,
                      const engine::core::TensorValue &v_heads, int64_t dim,
                      bool is_causal) {
   const engine::modules::MatMulModule matmul;
-  auto scores = matmul.build(
-      ctx, q_heads,
-      engine::modules::TransposeModule({{0, 1, 3, 2}, k_heads.shape.rank})
-          .build(ctx, k_heads));
+  const size_t rank = q_heads.shape.rank;
+  const bool broadcast = ctx.broadcast_kv_heads &&
+                         k_heads.shape.dims[rank - 3] != q_heads.shape.dims[rank - 3];
+  // lhs * rhs^T with rhs^T already as ggml wants it, and rhs's head count dividing lhs's.
+  const auto broadcast_mul = [&](const engine::core::TensorValue &lhs,
+                                 ggml_tensor *rhs_t, int64_t cols) {
+    auto shape = lhs.shape;
+    shape.dims[rank - 1] = cols;
+    return engine::core::wrap_tensor(ggml_mul_mat(ctx.ggml, rhs_t, lhs.tensor),
+                                     shape, GGML_TYPE_F32);
+  };
+  auto scores =
+      broadcast
+          ? broadcast_mul(q_heads, k_heads.tensor, k_heads.shape.dims[rank - 2])
+          : matmul.build(ctx, q_heads,
+                         engine::modules::TransposeModule(
+                             {{0, 1, 3, 2}, k_heads.shape.rank})
+                             .build(ctx, k_heads));
   scores = engine::core::wrap_tensor(
       ggml_scale(ctx.ggml, scores.tensor,
                  1.0F / std::sqrt(static_cast<float>(dim))),
@@ -127,6 +141,11 @@ attention_from_heads(engine::core::ModuleBuildContext &ctx,
   scores = ensure_contiguous(ctx, scores);
   auto attn = engine::core::wrap_tensor(ggml_soft_max(ctx.ggml, scores.tensor),
                                         scores.shape, GGML_TYPE_F32);
+  if (broadcast) {
+    const auto v_t = ensure_contiguous(
+        ctx, engine::modules::TransposeModule({{0, 1, 3, 2}, rank}).build(ctx, v_heads));
+    return broadcast_mul(attn, v_t.tensor, v_heads.shape.dims[rank - 1]);
+  }
   return matmul.build(ctx, attn, v_heads);
 }
 

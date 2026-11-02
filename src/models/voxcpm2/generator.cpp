@@ -20,6 +20,9 @@
 
 #include <ggml-backend.h>
 #include <ggml.h>
+#include <ggml-cpu.h>
+
+#include <cstdlib>
 
 #include <algorithm>
 #include <chrono>
@@ -621,6 +624,7 @@ private:
           "failed to initialize VoxCPM2 local encoder graph context");
     }
     engine::core::ModuleBuildContext ctx{ctx_.get(), "voxcpm2.local_encoder"};
+    ctx.broadcast_kv_heads = ggml_backend_is_cpu(weights_->backend()) && getenv("VOXCPM2_NO_KV_BROADCAST") == nullptr;
     const auto &feat_weights = weights_->weights().feat_encoder;
     auto x = engine::core::make_tensor(
         ctx, GGML_TYPE_F32,
@@ -800,6 +804,7 @@ private:
           "failed to initialize VoxCPM2 DiT estimator graph context");
     }
     engine::core::ModuleBuildContext ctx{ctx_.get(), "voxcpm2.dit.estimator"};
+    ctx.broadcast_kv_heads = ggml_backend_is_cpu(weights_->backend()) && getenv("VOXCPM2_NO_KV_BROADCAST") == nullptr;
     const auto &weights = weights_->weights().dit;
     x_ = engine::core::make_tensor(
              ctx, GGML_TYPE_F32,

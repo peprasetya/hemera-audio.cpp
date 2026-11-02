@@ -130,6 +130,8 @@ option(ENGINE_HIP_STRIX_HALO_OPTIMIZATIONS
 # librknnrt. The engine links the board runtime; the models themselves are
 # converted offline on x86 with rknn-toolkit2.
 option(ENGINE_ENABLE_RKNN "Build the Rockchip NPU (librknnrt) decoder path" OFF)
+option(ENGINE_ENABLE_XDNA "Run large matmuls of the CPU backend on an AMD XDNA2 NPU, through XRT" OFF)
+set(ENGINE_XDNA_XRT_ROOT "/usr" CACHE PATH "Where XRT is: <root>/include/xrt and <root>/lib/x86_64-linux-gnu/libxrt_coreutil.so")
 option(ENGINE_ENABLE_NEON "Build opt-in NEON library and native model paths" OFF)
 set(ENGINE_RKNN_INCLUDE_DIR "" CACHE PATH "Directory containing rknn_api.h (empty = use the system include path)")
 set(ENGINE_RKNN_LIBRARY "rknnrt" CACHE STRING "librknnrt to link (path or library name)")
@@ -389,6 +391,8 @@ set(GGML_HIP ${ENGINE_ENABLE_HIP} CACHE BOOL "Build ggml with HIP backend suppor
 set(GGML_VULKAN ${ENGINE_ENABLE_VULKAN} CACHE BOOL "Build ggml with Vulkan backend support" FORCE)
 set(GGML_METAL ${ENGINE_ENABLE_METAL} CACHE BOOL "Build ggml with Metal backend support" FORCE)
 set(GGML_LLAMAFILE ${ENGINE_ENABLE_LLAMAFILE} CACHE BOOL "Build ggml with llamafile SGEMM support" FORCE)
+set(GGML_XDNA ${ENGINE_ENABLE_XDNA} CACHE BOOL "Run large matmuls on an AMD XDNA2 NPU" FORCE)
+set(GGML_XDNA_XRT_ROOT ${ENGINE_XDNA_XRT_ROOT} CACHE PATH "Where XRT is" FORCE)
 set(GGML_CUDA_GRAPHS ${ENGINE_ENABLE_CUDA_GRAPHS} CACHE BOOL "Enable ggml CUDA graphs support" FORCE)
 # HIP graphs are controlled by a separate upstream option that defaults to ON;
 # keep it in sync so ENGINE_ENABLE_CUDA_GRAPHS=OFF also disables graphs on HIP builds

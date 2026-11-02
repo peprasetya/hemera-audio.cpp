@@ -6,6 +6,9 @@
 #include "traits.h"
 #include "ggml-cpu-impl.h"
 #include "ggml-impl.h"
+#ifdef GGML_USE_XDNA
+#include "xdna/ggml-xdna.h"
+#endif
 #include "quants.h"
 #include "ggml-threading.h"
 #include "unary-ops.h"
@@ -1251,6 +1254,13 @@ static void ggml_compute_forward_mul_mat_one_chunk(
 void ggml_compute_forward_mul_mat(
         const struct ggml_compute_params * params,
               struct ggml_tensor * dst) {
+
+#ifdef GGML_USE_XDNA
+    if (ggml_xdna_owns(dst)) {
+        ggml_xdna_mul_mat(dst);
+        return;
+    }
+#endif
 
     const struct ggml_tensor * src0 = dst->src[0];
     const struct ggml_tensor * src1 = dst->src[1];
@@ -3189,6 +3199,72 @@ static int ggml_cpu_try_fuse_ops(
     return 0;
 }
 
+// GGML_OP_PROFILE=1: where the CPU time goes, per op and per matmul shape, printed at exit.
+// Times come from thread 0 around the barrier, so they are wall time for that node.
+typedef struct { char key[96]; long long count; double ms; double macs; } ggml_opprof_entry;
+static ggml_opprof_entry ggml_opprof[8192];
+static int ggml_opprof_n = 0;
+static int ggml_opprof_on = -1;
+static double ggml_opprof_now(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return t.tv_sec * 1e3 + t.tv_nsec / 1e6; }
+static int ggml_opprof_cmp(const void * a, const void * b) { double d = ((const ggml_opprof_entry *) b)->ms - ((const ggml_opprof_entry *) a)->ms; return d > 0 ? 1 : d < 0 ? -1 : 0; }
+static void ggml_opprof_dump(void) {
+    qsort(ggml_opprof, ggml_opprof_n, sizeof(ggml_opprof[0]), ggml_opprof_cmp);
+    double total = 0; for (int i = 0; i < ggml_opprof_n; i++) total += ggml_opprof[i].ms;
+    fprintf(stderr, "OPPROF total %.1f ms in %d keys\n", total, ggml_opprof_n);
+    for (int i = 0; i < ggml_opprof_n && i < 80; i++)
+        fprintf(stderr, "OPPROF %9.1f ms %5.1f%% %8lld calls %8.3f ms/call %10.1f GMAC  %s\n", ggml_opprof[i].ms, 100 * ggml_opprof[i].ms / total, ggml_opprof[i].count, ggml_opprof[i].ms / ggml_opprof[i].count, ggml_opprof[i].macs / 1e9, ggml_opprof[i].key);
+}
+static void ggml_opprof_add(const struct ggml_tensor * node, double ms) {
+    char key[96]; double macs = 0;
+    if (node->op == GGML_OP_MUL_MAT) {
+        const struct ggml_tensor * a = node->src[0], * b = node->src[1];
+        long long rows = b->ne[1] * b->ne[2] * b->ne[3], k = a->ne[0], n = a->ne[1];
+        snprintf(key, sizeof key, "MUL_MAT %s*%s M=%lld K=%lld N=%lld", ggml_type_name(a->type), ggml_type_name(b->type), rows, k, n);
+        macs = (double) rows * k * n * a->ne[2] * a->ne[3];
+    } else if (node->op == GGML_OP_UNARY) {
+        snprintf(key, sizeof key, "UNARY %s", ggml_unary_op_name(ggml_get_unary_op(node)));
+    } else if (node->op == GGML_OP_CONCAT) {
+        snprintf(key, sizeof key, "CONCAT %lldx%lldx%lld", (long long) node->ne[0], (long long) node->ne[1], (long long) node->ne[2]);
+    } else {
+        snprintf(key, sizeof key, "%s", ggml_op_name(node->op));
+    }
+    int i = 0;
+    for (; i < ggml_opprof_n; i++) if (strcmp(ggml_opprof[i].key, key) == 0) break;
+    if (i == ggml_opprof_n) { if (i >= 8192) return; ggml_opprof_n++; strcpy(ggml_opprof[i].key, key); }
+    ggml_opprof[i].count++; ggml_opprof[i].ms += ms; ggml_opprof[i].macs += macs;
+}
+
+// Nodes too small to be worth a barrier. Only ops whose compute function has no barrier of its own.
+static int ggml_cpu_serial_elements = -1;
+
+static bool ggml_cpu_node_is_serial(const struct ggml_tensor * node) {
+#ifdef GGML_USE_XDNA
+    if (node->op == GGML_OP_MUL_MAT && ggml_xdna_owns(node)) {
+        return true;
+    }
+#endif
+    if (ggml_cpu_serial_elements <= 0) {
+        return false;
+    }
+    switch (node->op) {
+        case GGML_OP_CONCAT:
+        case GGML_OP_CONT:
+        case GGML_OP_ADD:
+        case GGML_OP_SUB:
+        case GGML_OP_MUL:
+        case GGML_OP_SCALE:
+        case GGML_OP_UNARY:
+        case GGML_OP_RMS_NORM:
+        case GGML_OP_ROPE:
+        case GGML_OP_SOFT_MAX:
+        case GGML_OP_GET_ROWS:
+        case GGML_OP_SET_ROWS:
+            return ggml_nelements(node) <= ggml_cpu_serial_elements;
+        default:
+            return false;
+    }
+}
+
 static thread_ret_t ggml_graph_compute_thread(void * data) {
     struct ggml_compute_state * state = (struct ggml_compute_state *) data;
     struct ggml_threadpool    * tp    = state->threadpool;
@@ -3217,6 +3293,8 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
     GGML_PRINT_DEBUG("thread #%d compute-start cplan %p last-graph %d\n", state->ith, (const void *)cplan, state->last_graph);
 #endif
 
+    bool serial_pending = false;
+
     for (int node_n = 0; node_n < cgraph->n_nodes && atomic_load_explicit(&tp->abort, memory_order_relaxed) != node_n; node_n++) {
         struct ggml_tensor * node = cgraph->nodes[node_n];
 
@@ -3227,6 +3305,29 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
 
         if ((node->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
             continue;
+        }
+
+        const double opprof_t0 = ggml_opprof_on > 0 && state->ith == 0 ? ggml_opprof_now() : 0;
+
+        // A small node, or one the NPU computes, is thread 0's alone. The others skip it and meet thread 0
+        // at the next node that does run in parallel, so a run of these costs no barriers at all.
+        if (params.nth > 1 && ggml_cpu_node_is_serial(node)) {
+            if (state->ith == 0) {
+                struct ggml_compute_params serial = params;
+                serial.nth = 1;
+                ggml_compute_forward(&serial, node);
+                if (opprof_t0 != 0) ggml_opprof_add(node, ggml_opprof_now() - opprof_t0);
+                if (cplan->abort_callback && cplan->abort_callback(cplan->abort_callback_data)) {
+                    atomic_store_explicit(&tp->abort, node_n + 1, memory_order_relaxed);
+                    tp->ec    = GGML_STATUS_ABORTED;
+                }
+            }
+            serial_pending = true;
+            continue;
+        }
+        if (serial_pending) {
+            ggml_barrier(state->threadpool);
+            serial_pending = false;
         }
 
         // TODO: move fused-op detection into ggml_graph_plan so fusion decisions are made once at planning time
@@ -3246,6 +3347,7 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
 
         if (node_n + 1 < cgraph->n_nodes) {
             ggml_barrier(state->threadpool);
+            if (opprof_t0 != 0) ggml_opprof_add(node, ggml_opprof_now() - opprof_t0);
         }
     }
 
@@ -3480,6 +3582,14 @@ struct ggml_threadpool * ggml_threadpool_new(struct ggml_threadpool_params * tpp
 }
 
 enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cplan * cplan) {
+    if (ggml_opprof_on < 0) {
+        ggml_opprof_on = getenv("GGML_OP_PROFILE") != NULL;
+        if (ggml_opprof_on) atexit(ggml_opprof_dump);
+    }
+    if (ggml_cpu_serial_elements < 0) {
+        const char * v = getenv("GGML_CPU_SERIAL_ELEMENTS");
+        ggml_cpu_serial_elements = v != NULL ? atoi(v) : 8192;
+    }
     ggml_cpu_init();
 
     GGML_ASSERT(cplan);
