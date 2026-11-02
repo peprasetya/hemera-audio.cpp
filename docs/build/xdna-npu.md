@@ -19,10 +19,14 @@ VoxCPM2 `q8_0`, streaming 14 s of Indonesian speech with a described voice:
 | `--backend vulkan`, alone | 2.4x realtime | 0.15 s | 0 s | | |
 | `--backend vulkan`, next to Qwen3.8 27B | 0.58x | | 7.1 s | 20 tokens/s | |
 | `--backend npu`, alone | 1.76x | 0.28 s | 0 s | | 3.5 cores |
-| `--backend npu`, next to Qwen3.8 27B | 1.24x | 0.34-0.46 s | 0 s | 20-21 tokens/s | 3.3 cores |
+| `--backend npu`, next to Qwen3.8 27B | 1.0-1.25x | 0.3-0.6 s | about 0 s | 20-21 tokens/s | 3.3 cores |
 | `--backend cpu`, 16 threads, offline | 0.8x | | | | 10.5 cores |
 
 OmniVoice `q8_0`, offline, 8 threads: RTF 2.62 on the CPU, 2.01 with the NPU.
+
+A soak next to Qwen3.8: 34 requests, 406 s of speech in 365 s, 0.17 s of dropouts in all, no errors, the LLM at
+20.1 tokens/s. Whisper large-v3 reading back seven hard sentences: 4.2% word errors on the NPU, 3.3% on Vulkan, with
+the errors on the same words (numbers, Latin).
 
 ## Requirements
 
@@ -131,7 +135,9 @@ These also speed up plain `--backend cpu` and give bit-identical output:
 ## Limits
 
 - `W` crosses memory on every call, so models with many large multiplies per second of audio remain bounded by
-  memory speed. Next to a language model on the GPU, VoxCPM2 drops from 1.76x to 1.24x realtime.
+  memory speed. VoxCPM2 needs about 13 GB/s for its DiT weights alone at realtime. Next to a language model on the
+  GPU a call takes 266 us instead of 197 us and host copies twice as long, so VoxCPM2 drops from 1.75x to 1.0-1.25x:
+  realtime, with little margin. A client that buffers 0.1-0.2 s rides out what is left.
 - The decoder and everything else still need a few CPU cores.
 - Only tested on Strix Halo. Other XDNA2 chips have the same array and should work.
 - First-generation XDNA (Phoenix, Hawk Point) is a different array and is not supported by this core program.
