@@ -1,5 +1,5 @@
 // Matrix multiplies on the AMD XDNA2 NPU (Strix, Strix Halo, Krackan), from inside the CPU backend.
-// Set GGML_XDNA=1 to turn it on. See ggml-xdna.cpp.
+// Set GGML_XDNA=1 to turn it on (--backend npu does). See ggml-xdna.cpp.
 #pragma once
 
 #include "ggml.h"
@@ -10,11 +10,19 @@
 extern "C" {
 #endif
 
-// Whether the NPU computes this matmul, in a team of nth threads. Same answer on every thread.
-bool ggml_xdna_owns(const struct ggml_tensor * dst, int nth);
+struct ggml_cgraph;
+struct ggml_threadpool;
 
-// Computes a matmul that ggml_xdna_owns said yes to.
-void ggml_xdna_mul_mat(struct ggml_tensor * dst);
+// Around a graph's computation, on the thread that starts it: prepares one NPU job for all the graph's matmuls that the
+// NPU should do, and ends it.
+void ggml_xdna_graph_begin(const struct ggml_cgraph * graph, int nth);
+void ggml_xdna_graph_end(void);
+
+// Whether this node is the graph's next NPU matmul. Same answer on every thread of the team.
+bool ggml_xdna_planned(const struct ggml_tensor * dst);
+
+// Computes it, on every thread of the team: the host's work is shared, the NPU's is started by thread 0.
+void ggml_xdna_mul_mat(int ith, int nth, struct ggml_threadpool * threadpool, struct ggml_tensor * dst);
 
 #ifdef __cplusplus
 }

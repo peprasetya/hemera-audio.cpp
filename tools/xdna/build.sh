@@ -7,18 +7,20 @@ set -e
 HERE=$(cd "$(dirname "$0")" && pwd)
 OUT=$(realpath -m "$1")
 WORK="$OUT/work"
+rm -rf "$WORK"
 mkdir -p "$WORK"
 cd "$HERE"
-GRAIN="16 64 64"
+TILE="-m 8 -k 64 -n 64"
 check=()
-for shape in "64 1024 4096" "64 128 512" "64 2048 12288" "128 2048 1024" "256 512 2048" "512 4096 4096" "1024 1024 2048" "2048 1024 1024"; do
+for shape in "32 1024 4096" "32 128 512" "32 2048 12288" "64 2048 1024" "128 512 2048" "256 4096 4096" "512 1024 2048" "1024 1024 1024"; do
     set -- $shape
     D="$WORK/$1x$2x$3"
     mkdir -p "$D"
-    python3 gemm_bfp.py --dev npu2 -M "$1" -K "$2" -N "$3" -m 16 -k 64 -n 64 --xclbin-path "$D/final.xclbin" --insts-path "$D/insts.bin" > "$D/build.log" 2>&1 || { tail -n 20 "$D/build.log"; exit 1; }
+    python3 gemm_bfp.py --dev npu2 -M "$1" -K "$2" -N "$3" $TILE --xclbin-path "$D/final.xclbin" --insts-path "$D/insts.bin" > "$D/build.log" 2>&1 || { tail -n 20 "$D/build.log"; exit 1; }
     check+=("$D/insts.bin" "$1" "$2" "$3")
 done
-cp "$WORK/64x1024x4096/final.xclbin" "$OUT/gemm_bfp.xclbin"
+cp "$WORK/32x1024x4096/final.xclbin" "$OUT/gemm_bfp.xclbin"
+
 g++ -std=c++17 -O1 -I"$HERE/../../external/ggml/src/ggml-cpu/xdna" check_insts.cpp -o "$WORK/check_insts"
 "$WORK/check_insts" "${check[@]}"
 echo "built $OUT/gemm_bfp.xclbin"

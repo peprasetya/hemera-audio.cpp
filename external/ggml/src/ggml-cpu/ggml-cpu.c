@@ -1256,8 +1256,8 @@ void ggml_compute_forward_mul_mat(
               struct ggml_tensor * dst) {
 
 #ifdef GGML_USE_XDNA
-    if (ggml_xdna_owns(dst, params->nth)) {
-        ggml_xdna_mul_mat(dst);
+    if (ggml_xdna_planned(dst)) {
+        ggml_xdna_mul_mat(params->ith, params->nth, params->threadpool, dst);
         return;
     }
 #endif
@@ -3237,12 +3237,7 @@ static void ggml_opprof_add(const struct ggml_tensor * node, double ms) {
 // Nodes too small to be worth a barrier. Only ops whose compute function has no barrier of its own.
 static int ggml_cpu_serial_elements = -1;
 
-static bool ggml_cpu_node_is_serial(const struct ggml_tensor * node, int nth) {
-#ifdef GGML_USE_XDNA
-    if (node->op == GGML_OP_MUL_MAT && ggml_xdna_owns(node, nth)) {
-        return true;
-    }
-#endif
+static bool ggml_cpu_node_is_serial(const struct ggml_tensor * node) {
     if (ggml_cpu_serial_elements <= 0) {
         return false;
     }
@@ -3309,9 +3304,9 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
 
         const double opprof_t0 = ggml_opprof_on > 0 && state->ith == 0 ? ggml_opprof_now() : 0;
 
-        // A small node, or one the NPU computes, is thread 0's alone. The others skip it and meet thread 0
-        // at the next node that does run in parallel, so a run of these costs no barriers at all.
-        if (ggml_cpu_node_is_serial(node, params.nth)) {
+        // A small node is thread 0's alone. The others skip it and meet thread 0 at the next node that does
+        // run in parallel, so a run of these costs no barriers at all.
+        if (params.nth > 1 && ggml_cpu_node_is_serial(node)) {
             if (state->ith == 0) {
                 struct ggml_compute_params serial = params;
                 serial.nth = 1;
@@ -3617,6 +3612,10 @@ enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cpl
         threadpool->ec               = GGML_STATUS_SUCCESS;
     }
 
+#ifdef GGML_USE_XDNA
+    ggml_xdna_graph_begin(cgraph, n_threads);
+#endif
+
 #ifdef GGML_USE_OPENMP
     if (n_threads > 1) {
         #pragma omp parallel num_threads(n_threads)
@@ -3652,6 +3651,10 @@ enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cpl
 
     // This is a work thread too
     ggml_graph_compute_thread(&threadpool->workers[0]);
+#endif
+
+#ifdef GGML_USE_XDNA
+    ggml_xdna_graph_end();
 #endif
 
     // don't leave affinity set on the main thread

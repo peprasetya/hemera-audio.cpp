@@ -387,7 +387,7 @@ public:
           "VoxCPM2 text embedding token id is out of range");
     }
     ggml_backend_tensor_set(token_id_, &token_id, 0, sizeof(token_id));
-    engine::core::set_backend_threads(weights_->backend(), weights_->threads());
+    engine::core::set_backend_threads(weights_->backend(), getenv("VOXCPM2_LM_THREADS") ? atoi(getenv("VOXCPM2_LM_THREADS")) : weights_->threads());
     const ggml_status status =
         engine::core::compute_backend_graph(weights_->backend(), graph_);
     ggml_backend_synchronize(weights_->backend());
@@ -681,7 +681,7 @@ public:
                             input.text_mask.size() * sizeof(float));
     ggml_backend_tensor_set(audio_mask_, input.audio_mask.data(), 0,
                             input.audio_mask.size() * sizeof(float));
-    engine::core::set_backend_threads(weights_->backend(), weights_->threads());
+    engine::core::set_backend_threads(weights_->backend(), getenv("VOXCPM2_LM_THREADS") ? atoi(getenv("VOXCPM2_LM_THREADS")) : weights_->threads());
     const ggml_status status =
         engine::core::compute_backend_graph(weights_->backend(), graph_);
     ggml_backend_synchronize(weights_->backend());
@@ -1166,7 +1166,7 @@ public:
     ggml_backend_tensor_set(attention_mask_, attention_mask_buffer_.data(), 0,
                             attention_mask_buffer_.size() *
                                 sizeof(ggml_fp16_t));
-    engine::core::set_backend_threads(weights_->backend(), weights_->threads());
+    engine::core::set_backend_threads(weights_->backend(), getenv("VOXCPM2_LM_THREADS") ? atoi(getenv("VOXCPM2_LM_THREADS")) : weights_->threads());
     const ggml_status status =
         engine::core::compute_backend_graph(weights_->backend(), graph_);
     ggml_backend_synchronize(weights_->backend());

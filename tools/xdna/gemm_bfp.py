@@ -7,11 +7,13 @@
 #   B: column c, then its n-tile t, then K chunk kk: one n x k tile
 #   C: column c, then row block, then n-tile t, then core row: one m x n tile of float32
 import argparse
+import re
 from pathlib import Path
 
 import aie.iron as iron
 import numpy as np
 from aie.dialects.aiex import v8bfp16ebs8
+from aie.ir import Module
 from aie.helpers.taplib import TensorAccessPattern
 from aie.iron import (Buffer, CompileTime, ExternalFunction, In, ObjectFifo, Out, Program, Runtime, TaskGroup, Worker, WorkerRuntimeBarrier)
 from aie.iron.controlflow import range_
@@ -32,9 +34,20 @@ def lin(total, offset, length, d0, repeat=1):
     return TensorAccessPattern((total,), offset, [repeat, d2, d1, d0], [0, d1 * d0, d0, 1])
 
 
+def with_doorbell(module):
+    """One more stream, on channels the placer leaves free: the host's doorbell, see ggml-xdna-insts.h."""
+    text = str(module)
+    last = [m for m in re.finditer(r"^\s*%\S+ = aie\.logical_tile<[^\n]*\n", text, re.M)][-1]
+    flow = """    %db_shim = aie.tile(7, 0)
+    %db_mem = aie.tile(7, 1)
+    aie.flow(%db_shim, DMA : 1, %db_mem, DMA : 5)
+"""
+    return Module.parse(text[: last.end()] + flow + text[last.end() :], module.context)
+
+
 @iron.jit(aiecc_flags=["--dynamic-objFifos"])
 def gemm(A: In, B: In, C: Out, *, M: CompileTime[int], K: CompileTime[int], N: CompileTime[int],
-         m: CompileTime[int] = 16, k: CompileTime[int] = 64, n: CompileTime[int] = 64):
+         m: CompileTime[int] = 8, k: CompileTime[int] = 64, n: CompileTime[int] = 64):
     assert M % (m * ROWS) == 0 and K % k == 0 and N % (n * COLS) == 0 and K // k >= 2
     a_l1 = np.ndarray[(m, k // 8), np.dtype[v8bfp16ebs8]]
     b_l1 = np.ndarray[(k, n // 8), np.dtype[v8bfp16ebs8]]
@@ -96,17 +109,17 @@ def gemm(A: In, B: In, C: Out, *, M: CompileTime[int], K: CompileTime[int], N: C
             for c in range(COLS):
                 c_hs[c].drain(C, tap=lin(c_total, (c * rbs + rb) * c_rb, c_rb, 1024 if c_rb % 1024 == 0 else 64), wait=True, group=tg)
                 if c < ROWS:
-                    a_hs[c].fill(A, tap=lin(a_total, (rb * ROWS + c) * a_row, a_row, 128, repeat=per_col), group=tg)
+                    a_hs[c].fill(A, tap=lin(a_total, (rb * ROWS + c) * a_row, a_row, 64, repeat=per_col), group=tg)
                 b_hs[c].fill(B, tap=lin(b_total, c * b_col, b_col, 256), group=tg)
 
     rt = Runtime(sequence, [A, B, C, a_prods, b_prods, c_cons])
-    return Program(iron.get_current_device(), rt, workers=[w for row in workers for w in row]).resolve_program()
+    return with_doorbell(Program(iron.get_current_device(), rt, workers=[w for row in workers for w in row]).resolve_program())
 
 
 def main():
     p = argparse.ArgumentParser()
     add_compile_args(p, default_dev="npu2")
-    for name, dflt in (("-M", 64), ("-K", 1024), ("-N", 4096), ("-m", 16), ("-k", 64), ("-n", 64)):
+    for name, dflt in (("-M", 64), ("-K", 1024), ("-N", 4096), ("-m", 8), ("-k", 64), ("-n", 64)):
         p.add_argument(name, type=int, default=dflt)
     opts = p.parse_args()
 
