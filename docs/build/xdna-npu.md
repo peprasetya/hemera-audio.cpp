@@ -2,31 +2,44 @@
 
 Runs the large matrix multiplies of the CPU backend on the NPU of Strix Point, Strix Halo and Krackan
 Point chips, through XRT on Linux. Select it with `--backend npu`. Everything else stays on the CPU, so
-the GPU is not used at all, and a language model can generate on the GPU at full speed at the same time.
+the GPU is not used at all, and a language model on the GPU keeps its full speed while speech is made.
 
 It is not a separate ggml backend: there is no graph splitting and no scheduler. The CPU graph loop gives
 an eligible `MUL_MAT` to the NPU on thread 0 and carries on (`external/ggml/src/ggml-cpu/xdna/`). Any model
 benefits whose weights are 8-bit or float and whose multiplies are large enough; nothing in a model has to
 change.
 
+**It does not make VoxCPM2 realtime at its default 10 flow steps.** It reaches realtime next to a language model
+only at about 4 steps. See the table.
+
 ## Measured
 
 Ryzen AI Max+ 395 (Radeon 8060S, `RyzenAI-npu5`, firmware 1.1.2.65), Ubuntu 26.04, kernel 7.0, XRT 2.21.75,
-VoxCPM2 `q8_0`, streaming 14 s of Indonesian speech with a described voice:
+VoxCPM2 `q8_0`, streaming 6-7 s of Indonesian speech. "Dropouts" is the silence a listener with no buffer hears.
 
-| | Speed | First audio | Dropouts | LLM on the GPU | CPU |
-|---|---|---|---|---|---|
-| `--backend vulkan`, alone | 2.4x realtime | 0.15 s | 0 s | | |
-| `--backend vulkan`, next to Qwen3.8 27B | 0.58x | | 7.1 s | 20 tokens/s | |
-| `--backend npu`, alone | 1.76x | 0.28 s | 0 s | | 3.5 cores |
-| `--backend npu`, next to Qwen3.8 27B | 1.0-1.25x | 0.3-0.6 s | about 0 s | 20-21 tokens/s | 3.3 cores |
-| `--backend cpu`, 16 threads, offline | 0.8x | | | | 10.5 cores |
+| | Alone | Next to Qwen3.8 27B on the GPU | The LLM meanwhile | CPU |
+|---|---|---|---|---|
+| `vulkan`, LLM frozen for each request | 2.4x, 0 s, first audio 0.11 s | 2.4x, 0 s, first audio 0.15-0.20 s | frozen | |
+| `vulkan`, LLM left running | 2.4x | 0.5-0.6x, 7-10 s in 10 s | 20 tokens/s | |
+| `npu`, 10 steps | 0.85x, 1 s, first audio 0.28 s | 0.55x, 5 s in 6.9 s | 20 tokens/s | 3.5 cores |
+| `npu`, 6 steps | 1.22x, 0 s | 0.76x, 2 s | 20 tokens/s | |
+| `npu`, 5 steps | 1.37x, 0 s | 0.85x, 1.1 s | 20 tokens/s | |
+| `npu`, 4 steps | 1.53x, 0 s, first audio 0.2 s | 0.94-1.01x, 0-0.3 s, first audio 0.24-0.35 s | 20 tokens/s | about 3 cores |
+| `npu`, 3 steps | 1.6x, 0 s | 1.1x, 0 s | 20 tokens/s | |
+| `cpu`, 16 threads, offline | 0.8x | | | 10.5 cores |
+
+Word errors, Whisper large-v3 reading back seven hard sentences (with numbers and Latin): Vulkan 3.3%, NPU at 10
+steps 4.2%, at 5 steps 2.1%, at 4 steps 3.0%, at 3 steps 9.2%, with invented words. Seven sentences are few:
+differences under about 5% mean little.
 
 OmniVoice `q8_0`, offline, 8 threads: RTF 2.62 on the CPU, 2.01 with the NPU.
 
-A soak next to Qwen3.8: 34 requests, 406 s of speech in 365 s, 0.17 s of dropouts in all, no errors, the LLM at
-20.1 tokens/s. Whisper large-v3 reading back seven hard sentences: 4.2% word errors on the NPU, 3.3% on Vulkan, with
-the errors on the same words (numbers, Latin).
+Stability: six minutes of speech without a pause next to Qwen3.8, 34 requests, no errors, the LLM at 20.1 tokens/s.
+A server killed with `kill -9` in the middle of a dispatch leaves the NPU usable by the next process.
+
+**Measuring.** Streamed PCM from `audiocpp_server` comes at the model's own rate, 48 kHz for VoxCPM2, not OpenAI's 24
+kHz. Read as 24 kHz, every speed looks twice as good, which is the mistake the first version of this document made.
+Check a speed against the length of a whole WAV of the same text.
 
 ## Requirements
 
@@ -81,15 +94,16 @@ For a server, in the model's entry:
 "default_request_options": { "stream_chunk_policy": "fixed", "stream_frames_per_event": 1 }
 ```
 
-- **`--threads 2`.** With the NPU doing the multiplies, more generator threads only wait; 2 is faster than 4.
+- **`--threads 2`.** The generator's own work is small next to the NPU's: at 10 steps, 2 threads give 0.86x realtime
+  on 3.5 cores in all, 4 give 0.90x on 5.9 cores, 6 give 0.95x on 8 cores.
 - **`voxcpm2.perf_mode`** packs each layer's gate and up (and query, key, value) into one multiply, so one
   dispatch instead of two or three. Despite its name it is not specific to CUDA.
 - **`voxcpm2.exec_plan`** gives the AudioVAE decoder its own CPU threads and its own worker, so the generator
   never waits for it.
-- **`stream_frames_per_event: 1`, policy `fixed`** sends audio every 0.32 s of speech. The default doubling
-  chunks arrive too far apart for the first seconds and the listener hears a gap.
-- **`num_inference_steps`** (default 10) is the most direct way to trade quality for speed: 5 reaches 2.6x
-  realtime, with occasional small word errors in our test.
+- **`stream_frames_per_event: 1`, policy `fixed`** sends audio every 0.16 s of speech. The default doubling chunks
+  arrive too far apart for the first seconds and the listener hears a gap.
+- **`num_inference_steps`** (default 10) is what decides whether this keeps up: see the table. 4 is the lowest that
+  still sounded right to Whisper; listen before you rely on it.
 
 Settings, all optional: `GGML_XDNA_XCLBIN` (the core program), `GGML_XDNA_MIN_M` (smallest batch sent),
 `GGML_XDNA_FORCE=1` (send every eligible multiply whatever it costs), `GGML_XDNA_TRACE=1` (time spent, at exit),
@@ -135,9 +149,9 @@ These also speed up plain `--backend cpu` and give bit-identical output:
 ## Limits
 
 - `W` crosses memory on every call, so models with many large multiplies per second of audio remain bounded by
-  memory speed. VoxCPM2 needs about 13 GB/s for its DiT weights alone at realtime. Next to a language model on the
-  GPU a call takes 266 us instead of 197 us and host copies twice as long, so VoxCPM2 drops from 1.75x to 1.0-1.25x:
-  realtime, with little margin. A client that buffers 0.1-0.2 s rides out what is left.
+  memory speed. VoxCPM2 at 10 steps needs about 13 GB/s for its DiT weights alone at realtime. Next to a language
+  model on the GPU a call takes 266 us instead of 197 us and host copies twice as long, which is the drop in the
+  table's second column.
 - The decoder and everything else still need a few CPU cores.
 - Only tested on Strix Halo. Other XDNA2 chips have the same array and should work.
 - First-generation XDNA (Phoenix, Hawk Point) is a different array and is not supported by this core program.
