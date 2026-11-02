@@ -22,6 +22,7 @@ from aie.utils.hostruntime.cli import run_design_cli
 
 SRC = str(Path(__file__).resolve().parent / "mm_bfp_f32.cc")
 ROWS, COLS = 4, 8
+B_GROUP, B_DEPTH = 16, 5  # 368 KB of weights per column of the array
 
 
 def lin(total, offset, length, d0, repeat=1):
@@ -53,7 +54,10 @@ def gemm(A: In, B: In, C: Out, *, M: CompileTime[int], K: CompileTime[int], N: C
     b_l1 = np.ndarray[(k, n // 8), np.dtype[v8bfp16ebs8]]
     c_l1 = np.ndarray[(m, n), np.dtype[np.float32]]
     a_l2 = np.ndarray[(m * k // 8,), np.dtype[v8bfp16ebs8]]
-    b_l2 = np.ndarray[(k * n // 8,), np.dtype[v8bfp16ebs8]]
+    # B waits in the memory tile in groups of B_GROUP tiles: the next matmul's weights are fetched while the host is still
+    # working, so a transfer has to be a whole number of groups.
+    assert (N // n // COLS) * (K // k) % B_GROUP == 0, (N, K)
+    b_l2 = np.ndarray[(B_GROUP * k * n // 8,), np.dtype[v8bfp16ebs8]]
     c_l2 = np.ndarray[(m * n * ROWS,), np.dtype[np.float32]]
     flags = [f"-DDIM_M={m}", f"-DDIM_K={k}", f"-DDIM_N={n}"]
     first = ExternalFunction("mm_first", source_file=SRC, arg_types=[a_l1, b_l1, c_l1], compile_flags=flags + ["-DMM_FIRST"])
@@ -61,7 +65,7 @@ def gemm(A: In, B: In, C: Out, *, M: CompileTime[int], K: CompileTime[int], N: C
 
     a3 = [ObjectFifo(a_l2, name=f"A3_{r}", depth=2) for r in range(ROWS)]
     a1 = [a3[r].cons().split([0], obj_types=[a_l1], names=[f"A1_{r}"])[0] for r in range(ROWS)]
-    b3 = [ObjectFifo(b_l2, name=f"B3_{c}", depth=2) for c in range(COLS)]
+    b3 = [ObjectFifo(b_l2, name=f"B3_{c}", depth=B_DEPTH) for c in range(COLS)]
     b1 = [b3[c].cons().forward(obj_type=b_l1, name=f"B1_{c}") for c in range(COLS)]
     c3 = [ObjectFifo(c_l2, name=f"C3_{c}", depth=2) for c in range(COLS)]
     c1 = [c3[c].prod().join([m * n * r for r in range(ROWS)], obj_types=[c_l1] * ROWS, names=[f"C1_{c}_{r}" for r in range(ROWS)], depths=[2] * ROWS) for c in range(COLS)]

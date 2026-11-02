@@ -10,7 +10,8 @@
 // it does. So a graph's matmuls run as one job: the job's stream knows them all in advance and waits for a doorbell in
 // shared memory before each, and the host sees a matmul has finished when a sentinel in its output is overwritten. No
 // driver call per matmul, 20 us instead of 75. All weights live in a few large buffers, because a job can name only five
-// buffers.
+// buffers. And each matmul's weights start crossing as soon as the last one is done, into the memory tiles, so that the
+// host's work between matmuls overlaps with the transfer; next to a GPU competing for memory this is worth a third.
 //
 // Settings, read once:
 //   GGML_XDNA=1               turn it on (--backend npu does)
@@ -96,7 +97,13 @@ inline void encode_block(const float * x, uint8_t * o) {
 }
 
 inline int64_t up_to(int64_t v, int64_t grain) { return (v + grain - 1) / grain * grain; }
-inline int64_t pad_k(int64_t K) { return std::max(up_to(K, TK), 2 * TK); }
+// K as the design takes it: a multiple of its tile, and a column's weights a whole number of B_GROUP tiles.
+inline int64_t pad_k(int64_t K, int64_t Np) {
+    const int64_t per_col = Np / TN / COLS;
+    int64_t Kp = std::max(up_to(K, TK), 2 * TK);
+    while ((Kp / TK * per_col) % B_GROUP != 0) Kp += TK;
+    return Kp;
+}
 
 // Block index of (tile, row inside the tile, column block) in a tiled operand. Inside a tile of 16 rows or more the row
 // pairs (16 rows) come one after another, and in a pair the 8x8 subtiles alternate between its two rows of subtiles.
@@ -319,8 +326,8 @@ struct npu {
             const int64_t K = w->ne[0], N = w->ne[1], rows = x->ne[1] * x->ne[2] * x->ne[3];
             step & s = steps[i];
             s.M = up_to(rows, GRAIN_M);
-            s.Kp = pad_k(K);
             s.Np = up_to(N, GRAIN_N);
+            s.Kp = pad_k(K, s.Np);
             slot sl;
             if (!place_weight(w, N, K, s.Np, s.Kp, sl)) return nullptr;
             s.chunk = sl.chunk;
@@ -342,8 +349,7 @@ struct npu {
             st.doorbell_start({ARG_A, 0});
             for (size_t i = 0; i < seg.count; i++) {
                 const step & s = p->steps[first + i];
-                st.doorbell_wait((uint32_t) (i + 1));
-                st.matmul(s.M, s.Kp, s.Np, {ARG_A, A_DATA}, {ARG_W[s.chunk], s.off}, {ARG_C, 0});
+                st.matmul(s.M, s.Kp, s.Np, {ARG_A, A_DATA}, {ARG_W[s.chunk], s.off}, {ARG_C, 0}, (uint32_t) (i + 1));
             }
             st.doorbell_stop();
             const auto words = st.finish();
@@ -402,8 +408,9 @@ struct npu {
         *mailbox = seq;
         _mm_clflush((const void *) mailbox);
         _mm_mfence();
-        // Most of this wait is the weights crossing: no need to keep asking until they should have.
-        const double expected = 0.8 * (double) (s.M / GRAIN_M) * s.Kp * s.Np * BLOCK / 8 / 57e3;
+        // Most of this wait is the weights crossing, part of which has already happened: no need to keep asking until the
+        // rest should have.
+        const double expected = 0.4 * (double) (s.M / GRAIN_M) * s.Kp * s.Np * BLOCK / 8 / 57e3;
         while (us_since(t) < expected) _mm_pause();
         for (int col = 0; col < COLS; col++) {
             const float * e = cm + (col + 1) * s.M * s.Np / COLS - 1;
@@ -486,7 +493,7 @@ bool owns(const ggml_tensor * dst, int nth) {
     if (!g_no_room.empty() && g_no_room.count(w->data)) return false;
     // Measured on Strix Halo. The NPU: a doorbell, then W at 52 GB/s for every row block, then A and C on the host, shared
     // among the team. The CPU on 8-bit weights: about 25 GMAC/s a thread, up to what memory gives, about 100 GMAC/s together.
-    const int64_t Kp = pad_k(K), Np = up_to(N, GRAIN_N), row_blocks = up_to(rows, GRAIN_M) / GRAIN_M;
+    const int64_t Np = up_to(N, GRAIN_N), Kp = pad_k(K, Np), row_blocks = up_to(rows, GRAIN_M) / GRAIN_M;
     const double npu_us = 25.0 + (double) row_blocks * Kp * Np * BLOCK / 8 / 52e3 + 2e-3 * rows * (Kp + Np) / nth;
     const double cpu_us = (double) rows * K * N / std::min(25e3 * nth, 100e3);
     return g_force || npu_us < cpu_us;

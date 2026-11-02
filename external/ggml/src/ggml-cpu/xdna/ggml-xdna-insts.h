@@ -20,6 +20,7 @@ namespace ggml_xdna {
 constexpr int64_t TM = 8, TK = 64, TN = 64, ROWS = 4, COLS = 8;  // tile sizes and core grid of the design
 constexpr int64_t GRAIN_M = TM * ROWS, GRAIN_N = TN * COLS;
 constexpr size_t BLOCK = 9;
+constexpr int64_t B_GROUP = 16;  // a column's weights transfer is a whole number of these many tiles
 
 // Where the placer put each stream. Fixed by the design, not by the shape.
 constexpr int A_SHIM[ROWS][2] = {{3, 0}, {3, 1}, {2, 0}, {4, 0}};
@@ -67,8 +68,18 @@ struct stream {
         for (auto [col, b] : group) used[col].erase(b);
         group.clear();
     }
-    void matmul(int64_t M, int64_t K, int64_t N, const place & a, const place & b, const place & c) {
+    // With a doorbell number, the weights start crossing right away and the rest waits for the doorbell: the memory tiles
+    // fill while the host is still working, so the host's time and the transfer's overlap.
+    void matmul(int64_t M, int64_t K, int64_t N, const place & a, const place & b, const place & c, uint32_t doorbell = 0) {
         const int64_t nk = K / TK, per_col = N / TN / COLS, rbs = M / TM / ROWS;
+        const int64_t b_col0 = (N / COLS) * K / 8;
+        std::vector<std::vector<std::pair<int, int>>> groups(rbs);
+        if (doorbell != 0) {
+            for (int col = 0; col < COLS; col++)
+                task(groups[0], B_SHIM[col][0], b, (uint64_t) (col * b_col0 * BLOCK), (uint32_t) (b_col0 * BLOCK / 4),
+                     B_SHIM[col][1] ? MM2S1_QUEUE : MM2S0_QUEUE, 1, false);
+            doorbell_wait(doorbell);
+        }
         for (int row = 2; row < 2 + ROWS; row++)
             for (int col = 0; col < COLS; col++) {
                 write32(tile_addr(col, row, RTP_NMID), (uint32_t) (nk - 1));
@@ -76,7 +87,6 @@ struct stream {
                 write32(tile_addr(col, row, BARRIER_LOCK), 1);
             }
         const int64_t a_row = TM * K / 8, b_col = (N / COLS) * K / 8, c_rb = per_col * ROWS * TM * TN;
-        std::vector<std::vector<std::pair<int, int>>> groups(rbs);
         for (int64_t rb = 0; rb < rbs; rb++) {
             if (rb >= 4) wait_all(groups[rb - 4]);
             for (int col = 0; col < COLS; col++) {
@@ -84,8 +94,9 @@ struct stream {
                 if (col < ROWS)
                     task(groups[rb], A_SHIM[col][0], a, (uint64_t) ((rb * ROWS + col) * a_row * BLOCK), (uint32_t) (a_row * BLOCK / 4),
                          A_SHIM[col][1] ? MM2S1_QUEUE : MM2S0_QUEUE, (uint32_t) per_col, false, rb >= 4);
-                task(groups[rb], B_SHIM[col][0], b, (uint64_t) (col * b_col * BLOCK), (uint32_t) (b_col * BLOCK / 4),
-                     B_SHIM[col][1] ? MM2S1_QUEUE : MM2S0_QUEUE, 1, false, rb >= 4);
+                if (rb > 0 || doorbell == 0)
+                    task(groups[rb], B_SHIM[col][0], b, (uint64_t) (col * b_col * BLOCK), (uint32_t) (b_col * BLOCK / 4),
+                         B_SHIM[col][1] ? MM2S1_QUEUE : MM2S0_QUEUE, 1, false, rb >= 4);
             }
         }
         for (int64_t rb = std::max<int64_t>(0, rbs - 4); rb < rbs; rb++) wait_all(groups[rb]);
