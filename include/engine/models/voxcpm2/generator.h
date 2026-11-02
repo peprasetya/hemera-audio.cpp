@@ -28,6 +28,7 @@ struct VoxCPM2FeatureGeneratorConfig {
   engine::assets::TensorStorageType weight_storage_type =
       engine::assets::TensorStorageType::Native;
   bool optimized = false;
+  int lm_threads = 0;
 };
 
 class VoxCPM2FeatureGeneratorRuntime final {

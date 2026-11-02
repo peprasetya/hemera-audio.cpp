@@ -46,7 +46,8 @@ runtime::ModelCliInterface cli(const VoxCPM2Assets &) {
       {"cfm_noise_file", "path", "Precomputed flow noise file.", false},
       {"stream_chunk_policy", "grow|fixed", "Streaming decoder cadence: grow emits one patch first, then doubles toward stream_frames_per_event; fixed uses the configured size. Ignored offline.", false, "grow"},
       {"stream_frames_per_event", "int", "Maximum generated latent patches per streaming decoder event. Set to 1 for one-patch emission. Ignored offline.", false, "4", "1"},
-      {"stream_left_context", "int", "Previous patches decoded as streaming left context.", false, "3", "0", "8"},
+      {"stream_left_context", "int", "Previous patches decoded as streaming left context, with stream_decoder_state false.", false, "3", "0", "8"},
+      {"stream_decoder_state", "bool", "The streaming decoder carries its history from patch to patch, for the offline decode's samples at a quarter of the work. Default: true.", false, "true"},
       {"prompt_text", "string", "Transcript for continuation prompt audio, distinct from the base voice reference.", false},
       {"chunk_strategy", "continuation|stateless", "Long-form continuation or independent generation per chunk. Offline only. Default: continuation.", false, "continuation"},
       {"text_chunk_size", "int", "Framework long-form text chunk size. Offline only. Default: 2048.", false, "2048"},
@@ -72,6 +73,7 @@ runtime::ModelCliInterface cli(const VoxCPM2Assets &) {
       {"voxcpm2.audiovae_encoder_graph_arena_mb", "int", "AudioVAE encoder host graph-metadata arena size in MiB, not device workspace.", false, "1024", "1"},
       {"voxcpm2.audiovae_latent_capacity", "int", "Optional decoder graph reservation in latent frames, reused by shorter requests and doubled when exceeded; omitted builds the graph at each request's own frame count.", false, std::nullopt, "1"},
       {"voxcpm2.audiovae_encoder_sample_capacity", "int", "Reserved encoder sample capacity.", false, "240000", "1"},
+      {"voxcpm2.lm_threads", "int", "Threads for the language model's graphs. Default: the backend's. With --backend npu they stay on the CPU, while --threads only feeds the NPU.", false, "0", "0"},
       {"voxcpm2.exec_plan", "string", "JSON component execution plans. audiovae: impl=default/ggml; backend must match the session; no artifacts. params.threads is a nonnegative int: positive values require a CPU session and enable a dedicated AudioVAE backend with streaming decode overlap; omitted/0 shares the session backend.", false, "{}"},
   };
   return out;

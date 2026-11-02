@@ -306,7 +306,7 @@ public:
                             residual_hidden.size() * sizeof(float));
     ggml_backend_tensor_set(current_embed_, current_embed.data(), 0,
                             current_embed.size() * sizeof(float));
-    engine::core::set_backend_threads(weights_->backend(), getenv("VOXCPM2_DIT_THREADS") ? atoi(getenv("VOXCPM2_DIT_THREADS")) : weights_->threads());
+    engine::core::set_backend_threads(weights_->backend(), weights_->threads());
     const ggml_status status =
         engine::core::compute_backend_graph(weights_->backend(), graph_);
     ggml_backend_synchronize(weights_->backend());
@@ -597,7 +597,7 @@ public:
     }
     ggml_backend_tensor_set(input_, patch_features.data(), 0,
                             patch_features.size() * sizeof(float));
-    engine::core::set_backend_threads(weights_->backend(), getenv("VOXCPM2_DIT_THREADS") ? atoi(getenv("VOXCPM2_DIT_THREADS")) : weights_->threads());
+    engine::core::set_backend_threads(weights_->backend(), weights_->threads());
     const ggml_status status =
         engine::core::compute_backend_graph(weights_->backend(), graph_);
     ggml_backend_synchronize(weights_->backend());
@@ -776,7 +776,7 @@ public:
                             time_embedding.size() * sizeof(float));
     ggml_backend_tensor_set(delta_time_embedding_, delta_time_embedding.data(),
                             0, delta_time_embedding.size() * sizeof(float));
-    engine::core::set_backend_threads(weights_->backend(), getenv("VOXCPM2_DIT_THREADS") ? atoi(getenv("VOXCPM2_DIT_THREADS")) : weights_->threads());
+    engine::core::set_backend_threads(weights_->backend(), weights_->threads());
     const ggml_status status =
         engine::core::compute_backend_graph(weights_->backend(), graph_);
     ggml_backend_synchronize(weights_->backend());
@@ -1222,7 +1222,9 @@ public:
         cfm_(weights_, config.dit_graph_context_bytes, config.mem_saver),
         local_encoder_(weights_, config.local_encoder_graph_context_bytes,
                        config.mem_saver),
-        prompt_audio_embedding_cache_(config.prompt_cache_slots) {}
+        prompt_audio_embedding_cache_(config.prompt_cache_slots) {
+    weights_->set_lm_threads(config.lm_threads);
+  }
 
   VoxCPM2Result generate_zero_shot(const std::string &text,
                                    const VoxCPM2GenerationOptions &options) {
@@ -1630,7 +1632,10 @@ private:
       ++result.decode_patches;
       if (streaming) {
         const int64_t emit = result.decode_patches - 1;
-        const int64_t left = std::min(left_ctx, emit);
+        // A decoder that keeps its state needs the context only once, to start from.
+        const int64_t left = options.stream_decoder_state
+                                 ? (index == 0 ? emit : 0)
+                                 : std::min(left_ctx, emit);
         const int64_t first = emit - left;
         VoxCPM2StreamingChunk chunk;
         chunk.decode_features.assign(

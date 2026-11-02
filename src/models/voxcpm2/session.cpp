@@ -263,6 +263,7 @@ void validate_session_options(
         key == "voxcpm2.prompt_cache_slots" ||
         key == "voxcpm2.mem_saver" ||
         key == "voxcpm2.perf_mode" ||
+        key == "voxcpm2.lm_threads" ||
         key == "voxcpm2.denoise" || key == "voxcpm2.load_denoiser") {
       continue;
     }
@@ -365,6 +366,13 @@ VoxCPM2SessionBase::VoxCPM2SessionBase(runtime::TaskSpec task,
                     generator_config_.weight_storage_type);
   parse_weight_type(options.options, "voxcpm2.audiovae_weight_type",
                     decoder_config_.weight_storage_type);
+  if (const auto threads =
+          runtime::parse_i64_option(options.options, {"voxcpm2.lm_threads"})) {
+    if (*threads < 0 || *threads > std::numeric_limits<int>::max()) {
+      throw std::runtime_error("voxcpm2.lm_threads must be a nonnegative int");
+    }
+    generator_config_.lm_threads = static_cast<int>(*threads);
+  }
   if (const auto mem_saver =
           runtime::find_option(options.options, {"voxcpm2.mem_saver"})) {
     generator_config_.mem_saver =
@@ -562,7 +570,9 @@ VoxCPM2SessionBase::run_streaming_request(
   stream_config.policy = runtime::parse_streaming_audio_chunk_policy(
       runtime::find_option(request.options, {"stream_chunk_policy"}).value_or("grow"));
   stream_config.frame_width = static_cast<size_t>(assets_->config.patch_size * assets_->config.feat_dim);
-  stream_config.left_context_frames = static_cast<size_t>(generation_options.stream_left_context);
+  const bool keep_state = generation_options.stream_decoder_state;
+  stream_config.left_context_frames =
+      keep_state ? 0 : static_cast<size_t>(generation_options.stream_left_context);
   const size_t samples_per_patch = static_cast<size_t>(assets_->config.patch_size *
       product(assets_->config.audio_vae.decoder_rates));
   size_t emitted_chunks = 0;
@@ -583,6 +593,9 @@ VoxCPM2SessionBase::run_streaming_request(
     ++emitted_chunks;
   };
   auto decode = [&](const runtime::StreamingAudioWindow<float> &window) {
+    if (keep_state) {
+      return decoder_->stream_decode(window.data, static_cast<int64_t>(window.new_frames));
+    }
     auto audio = decoder_->decode_features(
         std::vector<float>(window.data, window.data + window.frames() * window.frame_width),
         static_cast<int64_t>(window.frames()));
@@ -597,7 +610,12 @@ VoxCPM2SessionBase::run_streaming_request(
   auto feed = [&](const std::vector<float> &reference,
                   const std::vector<float> &frames) {
     if (!started) {
-      streaming_audio_.begin(stream_config, decode, publish, reference);
+      if (keep_state) {
+        decoder_->stream_begin(reference, static_cast<int64_t>(reference.size() / stream_config.frame_width));
+        streaming_audio_.begin(stream_config, decode, publish);
+      } else {
+        streaming_audio_.begin(stream_config, decode, publish, reference);
+      }
       started = true;
     }
     streaming_audio_.push(frames);
@@ -856,6 +874,12 @@ VoxCPM2GenerationOptions VoxCPM2SessionBase::generation_options_from_request(
     throw std::runtime_error(
         "VoxCPM2 stream_left_context must be between 0 and " +
         std::to_string(kVoxCPM2MaxStreamLeftContext));
+  }
+  if (const auto match = runtime::find_option_match(
+          request.options,
+          {"voxcpm2.stream_decoder_state", "stream_decoder_state"})) {
+    options.stream_decoder_state =
+        runtime::parse_bool_option(match->value, match->key);
   }
   if (options.min_tokens < 0) {
     throw std::runtime_error("VoxCPM2 min_tokens must be non-negative");

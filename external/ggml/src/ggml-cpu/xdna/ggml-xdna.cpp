@@ -19,6 +19,7 @@
 //   GGML_XDNA_MIN_M=<n>       smallest M sent to the NPU (default 1: the cost estimate decides)
 //   GGML_XDNA_FORCE=1         send every eligible matmul, whatever it costs (tests)
 //   GGML_XDNA_TRACE=1         print where the time went at exit; a larger n: every n calls as well
+//   GGML_XDNA_TEST_STALL=<n>  don't ring the n-th doorbell, to see the NPU fail and come back (tests)
 #include "ggml-xdna.h"
 #include "ggml-xdna-insts.h"
 #include "ggml-impl.h"
@@ -209,7 +210,7 @@ struct step {
 // One job's stream, and two runs of it so that the next can be queued while the last is still finishing.
 struct segment {
     size_t first = 0, count = 0;
-    xrt::bo insts;
+    xrt::bo insts[2];  // a stream for each JOB_MARK
     unsigned words = 0;
     std::unique_ptr<xrt::run> runs[2];
     bool started[2] = {false, false};
@@ -240,6 +241,8 @@ struct npu {
     std::unordered_map<const void *, slot> weights;
     std::unordered_map<uint64_t, std::unique_ptr<program>> programs;
     volatile uint32_t * mailbox = nullptr;
+    int mark = 0;  // the running job's JOB_MARK
+    long long test_stall = 0;
     // accounting
     long long trace_every = 0, calls = 0, jobs = 0;
     double us_pack = 0, us_run = 0, us_unpack = 0, us_w = 0, macs = 0;
@@ -345,18 +348,20 @@ struct npu {
             segment seg;
             seg.first = first;
             seg.count = std::min(MAX_STEPS_PER_JOB, p->steps.size() - first);
-            stream st;
-            st.doorbell_start({ARG_A, 0});
-            for (size_t i = 0; i < seg.count; i++) {
-                const step & s = p->steps[first + i];
-                st.matmul(s.M, s.Kp, s.Np, {ARG_A, A_DATA}, {ARG_W[s.chunk], s.off}, {ARG_C, 0}, (uint32_t) (i + 1));
+            for (int m = 0; m < 2; m++) {
+                stream st;
+                st.doorbell_start({ARG_A, 0});
+                for (size_t i = 0; i < seg.count; i++) {
+                    const step & s = p->steps[first + i];
+                    st.matmul(s.M, s.Kp, s.Np, {ARG_A, A_DATA}, {ARG_W[s.chunk], s.off}, {ARG_C, 0}, JOB_MARK[m] | (uint32_t) (i + 1));
+                }
+                st.doorbell_stop();
+                const auto words = st.finish();
+                seg.words = (unsigned) words.size();
+                seg.insts[m] = xrt::bo(dev, words.size() * 4, XCL_BO_FLAGS_CACHEABLE, kern.group_id(1));
+                memcpy(seg.insts[m].map<void *>(), words.data(), words.size() * 4);
+                seg.insts[m].sync(XCL_BO_SYNC_BO_TO_DEVICE);
             }
-            st.doorbell_stop();
-            const auto words = st.finish();
-            seg.words = (unsigned) words.size();
-            seg.insts = xrt::bo(dev, words.size() * 4, XCL_BO_FLAGS_CACHEABLE, kern.group_id(1));
-            memcpy(seg.insts.map<void *>(), words.data(), words.size() * 4);
-            seg.insts.sync(XCL_BO_SYNC_BO_TO_DEVICE);
             p->segments.push_back(std::move(seg));
         }
         return programs.emplace(h, std::move(p)).first->second.get();
@@ -375,11 +380,9 @@ struct npu {
             }
             seg.started[i] = true;
         }
-        *mailbox = 0;
-        _mm_clflush((const void *) mailbox);
-        _mm_mfence();
+        mark = 1 - mark;
         r->set_arg(0, 3u);
-        r->set_arg(1, seg.insts);
+        r->set_arg(1, seg.insts[mark]);
         r->set_arg(2, seg.words);
         r->set_arg(3 + ARG_A, a);
         r->set_arg(3 + ARG_C, c);
@@ -388,11 +391,20 @@ struct npu {
         jobs++;
     }
 
-    // The job's last matmul is done: lets the job end (stream::doorbell_stop).
-    void ring_end() {
-        *mailbox = 0;
-        _mm_clflush((const void *) mailbox);
-        _mm_mfence();
+    // A new context, for when the NPU has stopped answering. Taking the old one down waits for its stuck job, as long as
+    // the driver's own timeout for a job. Programs and buffers stay.
+    void reopen() {
+        for (auto & kv : programs)
+            for (segment & seg : kv.second->segments) {
+                seg.runs[0].reset();
+                seg.runs[1].reset();
+                seg.started[0] = seg.started[1] = false;
+                seg.next = 0;
+            }
+        kern = xrt::kernel();
+        ctx = xrt::hw_context();
+        ctx = xrt::hw_context(dev, xb.get_uuid());
+        kern = xrt::kernel(ctx, "MLIR_AIE");
     }
 
     // Rings the doorbell for a step of the running job and waits for its output to arrive.
@@ -405,9 +417,11 @@ struct npu {
         }
         _mm_mfence();
         const auto t = clk::now();
-        *mailbox = seq;
-        _mm_clflush((const void *) mailbox);
-        _mm_mfence();
+        if (test_stall == 0 || --test_stall != 0) {
+            *mailbox = JOB_MARK[mark] | seq;
+            _mm_clflush((const void *) mailbox);
+            _mm_mfence();
+        }
         // Most of this wait is the weights crossing, part of which has already happened: no need to keep asking until the
         // rest should have.
         const double expected = 0.4 * (double) (s.M / GRAIN_M) * s.Kp * s.Np * BLOCK / 8 / 57e3;
@@ -439,6 +453,8 @@ std::atomic<plan *> g_active{nullptr};
 thread_local bool t_holds_plan = false;  // this thread started the job, and is the one to end it
 std::atomic<bool> g_step_failed{false};
 std::unordered_set<const void *> g_no_room;
+int g_failures = 0;
+clk::time_point g_last_failure;
 
 void trace_at_exit() {
     if (g_npu) g_npu->print_trace();
@@ -472,6 +488,7 @@ void init() {
             atexit(trace_at_exit);
             if (atoll(v) > 1) g_npu->trace_every = atoll(v);  // also every so many calls, for a server
         }
+        if (const char * v = getenv("GGML_XDNA_TEST_STALL")) g_npu->test_stall = atoll(v);
     } catch (const std::exception & e) {
         fprintf(stderr, "xdna: no NPU, staying on the CPU: %s\n", e.what());
     }
@@ -516,9 +533,28 @@ void mul_mat_fallback(const ggml_tensor * w, const float * x, float * out, int64
     }
 }
 
+// Everything goes on on the CPU while a new context is tried in the background. Failing again and again, it stays off.
 void give_up(const std::exception & e) {
     fprintf(stderr, "xdna: the NPU failed, back to the CPU: %s\n", e.what());
     g_on = false;
+    const auto now = clk::now();
+    if (now - g_last_failure > std::chrono::hours(1)) g_failures = 0;
+    g_last_failure = now;
+    if (++g_failures > 3) {
+        fprintf(stderr, "xdna: that was too many in an hour, staying on the CPU\n");
+        return;
+    }
+    std::thread([] {
+        std::lock_guard<std::mutex> lock(g_busy);
+        const auto t = clk::now();
+        try {
+            g_npu->reopen();
+            g_on = true;
+            fprintf(stderr, "xdna: the NPU is back after %.1f s\n", us_since(t) / 1e6);
+        } catch (const std::exception & e2) {
+            fprintf(stderr, "xdna: the NPU stays off: %s\n", e2.what());
+        }
+    }).detach();
 }
 
 }  // namespace
@@ -571,10 +607,7 @@ extern "C" void ggml_xdna_graph_end(void) {
                 const segment & seg = p.segments[pl->seg];
                 n.run_step(p.steps[pl->cur], (uint32_t) (pl->cur - seg.first + 1));
                 pl->cur++;
-                if (pl->cur == seg.first + seg.count) {
-                    n.ring_end();
-                    if (pl->cur < p.steps.size()) n.start(p.segments[++pl->seg]);
-                }
+                if (pl->cur == seg.first + seg.count && pl->cur < p.steps.size()) n.start(p.segments[++pl->seg]);
             }
         }
     } catch (const std::exception & e) {
@@ -585,7 +618,8 @@ extern "C" void ggml_xdna_graph_end(void) {
 
 extern "C" bool ggml_xdna_planned(const struct ggml_tensor * dst) {
     const plan * pl = g_active.load(std::memory_order_relaxed);
-    return pl != nullptr && pl->cur < pl->nodes.size() && pl->nodes[pl->cur] == dst;
+    // after a failure the rest of the graph is the CPU's; every thread sees that from the same node on, past a barrier
+    return pl != nullptr && !g_step_failed.load(std::memory_order_relaxed) && pl->cur < pl->nodes.size() && pl->nodes[pl->cur] == dst;
 }
 
 extern "C" void ggml_xdna_mul_mat(int ith, int nth, struct ggml_threadpool * threadpool, struct ggml_tensor * dst) {
@@ -641,15 +675,13 @@ extern "C" void ggml_xdna_mul_mat(int ith, int nth, struct ggml_threadpool * thr
         // the next matmul may be in the next job
         ggml_barrier(threadpool);
         pl.cur++;
-        if (!g_step_failed.load(std::memory_order_relaxed) && pl.cur == p.segments[seg_i].first + p.segments[seg_i].count) {
-            n.ring_end();
-            if (pl.cur < p.steps.size()) {
-                pl.seg = seg_i + 1;
-                try {
-                    n.start(p.segments[pl.seg]);
-                } catch (const std::exception & e) {
-                    give_up(e);
-                }
+        if (!g_step_failed.load(std::memory_order_relaxed) && pl.cur == p.segments[seg_i].first + p.segments[seg_i].count && pl.cur < p.steps.size()) {
+            pl.seg = seg_i + 1;
+            try {
+                n.start(p.segments[pl.seg]);
+            } catch (const std::exception & e) {
+                give_up(e);
+                g_step_failed = true;
             }
         }
     } else {

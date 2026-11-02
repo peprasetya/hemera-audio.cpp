@@ -4,7 +4,9 @@
 // A job is usually many matmuls: the stream waits for a doorbell in shared memory before each one, so starting a matmul
 // needs no driver call. A doorbell costs about 20 us where a job costs about 75 us. The doorbell's path is one more
 // stream in the core program: shim DMA, which keeps re-reading a word of host memory, to memory tile DMA, which keeps
-// writing it to the same place; the stream polls that place.
+// writing it to the same place; the stream polls that place. Doorbell values carry the job's turn, odd or even: what is
+// left in the stream from the job before can never look like one of this job's. So a job needs nothing from the host to
+// end, and the next can be queued and rung at any time.
 #pragma once
 
 #include <algorithm>
@@ -34,6 +36,7 @@ constexpr uint32_t RTP_NMID = 0x08800, RTP_TILES = 0x08804, BARRIER_LOCK = 0x1f0
 constexpr int DB_COL = 7, DB_SHIM_BD = 15, DB_MEM_BD = 47;
 constexpr uint32_t DB_MEM_ADDR = 0x70000;  // inside the memory tile, past what the design allocates
 constexpr uint32_t MEM_BD_BASE = 0xA0000, MEM_S2MM5_QUEUE = 0xA062C;
+constexpr uint32_t JOB_MARK[2] = {1u << 16, 2u << 16};  // or'd with the matmul's number in the job
 
 inline uint32_t tile_addr(int col, int row, uint32_t off) { return ((uint32_t) col << 25) | ((uint32_t) row << 20) | off; }
 
@@ -114,9 +117,6 @@ struct stream {
     }
     void doorbell_wait(uint32_t value) { poll(tile_addr(DB_COL, 1, DB_MEM_ADDR), value, 0xffffffff); }
     void doorbell_stop() {
-        // Words still in the stream when this job stops reach the next job's memory tile word. They must not look like a
-        // doorbell, so stop only once the host has put the mailbox back to 0 and that has come through.
-        doorbell_wait(0);
         // no next descriptor: both channels finish the transfer they are in and stop
         write32(tile_addr(DB_COL, 0, BD_BASE + BD_STRIDE * DB_SHIM_BD + 0x1c), 0x02000000u);
         write32(tile_addr(DB_COL, 1, MEM_BD_BASE + 0x20 * DB_MEM_BD + 4), (0x80000u + DB_MEM_ADDR) >> 2);

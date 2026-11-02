@@ -32,6 +32,9 @@ struct VoxCPM2GenerationOptions {
   // as in the offline decode. 0 decodes every patch alone. Range
   // [0, kVoxCPM2MaxStreamLeftContext].
   int64_t stream_left_context = 3;
+  // Streaming: the decoder carries its convolutions' history from patch to patch, for the offline decode's samples at one
+  // patch's work a patch. Off, it decodes the window above for every patch.
+  bool stream_decoder_state = true;
 };
 
 struct VoxCPM2PromptAudio {

@@ -39,6 +39,8 @@ public:
 
   runtime::AudioBuffer decode_features(const std::vector<float> &features,
                                        int64_t patches);
+  void stream_begin(const std::vector<float> &context, int64_t patches);
+  runtime::AudioBuffer stream_decode(const float *features, int64_t patches);
   VoxCPM2EncodedPrompt encode_prompt_audio(
       const std::optional<runtime::AudioBuffer> &prompt_audio,
       const std::string &prompt_text,

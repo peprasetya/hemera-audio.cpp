@@ -122,6 +122,9 @@ public:
   const VoxCPM2ModelWeights &weights() const noexcept;
   ggml_backend_t backend() const noexcept;
   int threads() const noexcept;
+  // The language model's graphs may want another number of threads than the rest (voxcpm2.lm_threads).
+  int lm_threads() const noexcept;
+  void set_lm_threads(int threads) noexcept;
   bool weights_uploaded() const noexcept;
 
 private:
