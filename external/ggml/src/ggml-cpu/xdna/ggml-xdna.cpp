@@ -32,6 +32,7 @@
 #include <xrt/experimental/xrt_xclbin.h>
 
 #include <immintrin.h>
+#include <signal.h>
 #include <unistd.h>
 
 #include <algorithm>
@@ -41,6 +42,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <iterator>
 #include <memory>
 #include <mutex>
 #include <stdexcept>
@@ -472,11 +474,15 @@ plan g_plan;
 std::atomic<plan *> g_active{nullptr};
 thread_local bool t_holds_plan = false;  // this thread started the job, and is the one to end it
 std::atomic<bool> g_step_failed{false};
+std::atomic<bool> g_ending{false};
 std::unordered_set<const void *> g_no_room;
 int g_failures = 0;
 clk::time_point g_last_failure;
 
 void give_up(const std::exception & e);
+void on_stop_signal(int sig);
+constexpr int STOP_SIGNALS[] = {SIGTERM, SIGINT, SIGHUP};
+void (*g_stop_handlers[std::size(STOP_SIGNALS)])(int);
 
 void trace_at_exit() {
     if (g_npu) g_npu->print_trace();
@@ -504,6 +510,7 @@ void init() {
     try {
         const auto t = clk::now();
         g_npu = new npu(path);  // never freed: the driver cleans up when the process ends
+        for (size_t i = 0; i < std::size(STOP_SIGNALS); i++) g_stop_handlers[i] = signal(STOP_SIGNALS[i], on_stop_signal);
         fprintf(stderr, "xdna: NPU %s ready in %.0f ms\n", g_npu->dev.get_info<xrt::info::device::name>().c_str(), us_since(t) / 1e3);
         if (const char * v = getenv("GGML_XDNA_TRACE")) {
             atexit(trace_at_exit);
@@ -518,6 +525,44 @@ void init() {
         }
     } catch (const std::exception & e) {
         fprintf(stderr, "xdna: no NPU, staying on the CPU: %s\n", e.what());
+    }
+}
+
+// The process is being stopped with a job in the middle of a graph: the job would wait for its doorbell until the driver's timeout,
+// and the NPU would run nothing else until then. So no more jobs, the rest of the graph goes to the CPU for whatever time it has
+// left, and the job hears the rest of its doorbells, each for as long as the matmul before it should take. Runs in a signal
+// handler: a server stopped in the middle of a request does not get as far as exit handlers.
+void end_job() {
+    g_ending = true;
+    plan * pl = g_active.load();
+    if (pl == nullptr || !g_on.load()) return;
+    g_step_failed = true;
+    npu & n = *g_npu;
+    const program & p = *pl->prog;
+    const segment & seg = p.segments[pl->seg];
+    double hold = 200;
+    for (size_t i = pl->cur; i < seg.first + seg.count; i++) {
+        const step & s = p.steps[i];
+        _mm_store_si128((__m128i *) const_cast<uint32_t *>(n.mailbox), _mm_set1_epi32((int) (JOB_MARK[n.mark] | (uint32_t) (i - seg.first + 1))));
+        _mm_clflush((const void *) n.mailbox);
+        _mm_mfence();
+        const auto t = clk::now();
+        while (us_since(t) < hold) _mm_pause();
+        hold = 200 + 3 * (double) (s.M / GRAIN_M) * s.Kp * s.Np * BLOCK / 8 / 30e3;
+    }
+}
+
+void on_stop_signal(int sig) {
+    end_job();
+    for (size_t i = 0; i < std::size(STOP_SIGNALS); i++) {
+        if (STOP_SIGNALS[i] != sig) continue;
+        if (g_stop_handlers[i] == SIG_IGN) return;
+        if (g_stop_handlers[i] != SIG_DFL) {
+            g_stop_handlers[i](sig);
+            return;
+        }
+        signal(sig, SIG_DFL);
+        raise(sig);
     }
 }
 
@@ -595,7 +640,7 @@ void give_up(const std::exception & e) {
 
 extern "C" void ggml_xdna_graph_begin(const struct ggml_cgraph * graph, int nth) {
     std::call_once(g_once, init);
-    if (!g_on) return;
+    if (!g_on || g_ending) return;
     std::vector<ggml_tensor *> nodes;
     for (int i = 0; i < graph->n_nodes; i++) {
         ggml_tensor * n = graph->nodes[i];
