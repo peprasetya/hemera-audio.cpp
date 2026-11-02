@@ -334,10 +334,12 @@ VoxCPM2WeightsRuntime::VoxCPM2WeightsRuntime(
     std::shared_ptr<const VoxCPM2Assets> assets,
     engine::core::ExecutionContext &execution_context,
     size_t weight_context_bytes,
-    engine::assets::TensorStorageType weight_storage_type, bool optimized)
+    engine::assets::TensorStorageType weight_storage_type, bool optimized, int lm_threads)
     : impl_(std::make_unique<Impl>(std::move(assets), execution_context,
                                    weight_context_bytes, weight_storage_type,
-                                   optimized)) {}
+                                   optimized)) {
+  impl_->lm_threads = lm_threads;
+}
 
 VoxCPM2WeightsRuntime::~VoxCPM2WeightsRuntime() = default;
 
@@ -357,10 +359,6 @@ int VoxCPM2WeightsRuntime::threads() const noexcept { return impl_->threads(); }
 
 int VoxCPM2WeightsRuntime::lm_threads() const noexcept {
   return impl_->lm_threads > 0 ? impl_->lm_threads : impl_->threads();
-}
-
-void VoxCPM2WeightsRuntime::set_lm_threads(int threads) noexcept {
-  impl_->lm_threads = threads;
 }
 
 bool VoxCPM2WeightsRuntime::weights_uploaded() const noexcept {

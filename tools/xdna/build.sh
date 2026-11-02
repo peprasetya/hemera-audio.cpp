@@ -18,6 +18,7 @@ for shape in "32 1024 4096" "32 1024 512" "32 2048 12288" "64 2048 1024" "128 51
     mkdir -p "$D"
     python3 gemm_bfp.py --dev npu2 -M "$1" -K "$2" -N "$3" $TILE --xclbin-path "$D/final.xclbin" --insts-path "$D/insts.bin" > "$D/build.log" 2>&1 || { tail -n 20 "$D/build.log"; exit 1; }
     check+=("$D/insts.bin" "$1" "$2" "$3")
+    python3 check_doorbell_word.py "$D/final.prj/input_with_addresses.mlir" "$HERE/../../external/ggml/src/ggml-cpu/xdna/ggml-xdna-insts.h"
 done
 cp "$WORK/32x1024x4096/final.xclbin" "$OUT/gemm_bfp.xclbin"
 

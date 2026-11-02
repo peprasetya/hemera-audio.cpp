@@ -115,7 +115,7 @@ public:
                         engine::core::ExecutionContext &execution_context,
                         size_t weight_context_bytes,
                         engine::assets::TensorStorageType weight_storage_type,
-                        bool optimized = false);
+                        bool optimized = false, int lm_threads = 0);
   ~VoxCPM2WeightsRuntime();
 
   const VoxCPM2Assets &assets() const noexcept;
@@ -124,7 +124,6 @@ public:
   int threads() const noexcept;
   // The language model's graphs may want another number of threads than the rest (voxcpm2.lm_threads).
   int lm_threads() const noexcept;
-  void set_lm_threads(int threads) noexcept;
   bool weights_uploaded() const noexcept;
 
 private:

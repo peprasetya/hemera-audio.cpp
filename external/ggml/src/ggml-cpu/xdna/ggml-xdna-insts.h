@@ -6,7 +6,12 @@
 // stream in the core program: shim DMA, which keeps re-reading a word of host memory, to memory tile DMA, which keeps
 // writing it to the same place; the stream polls that place. Doorbell values carry the job's turn, odd or even: what is
 // left in the stream from the job before can never look like one of this job's. So a job needs nothing from the host to
-// end, and the next can be queued and rung at any time.
+// end, and the next can be queued and rung at any time. A job leaves both channels idle (doorbell_stop): a task started on
+// top of one still finishing has been seen, next to a busy GPU, never to deliver.
+//
+// The doorbell has to get through while the job waits for it, so nothing may hold up its shim's reads: a stream on the same
+// shim that is blocked for lack of room in the memory tile can. That is why the doorbell's column fetches ahead only what its
+// memory tile holds.
 #pragma once
 
 #include <algorithm>
@@ -32,10 +37,15 @@ constexpr uint32_t MM2S0_QUEUE = 0x1d214, MM2S1_QUEUE = 0x1d21c;
 constexpr uint32_t MM2S0_STATUS = 0x1d228, MM2S1_STATUS = 0x1d22c, QUEUE_FULL = 0x400000;
 constexpr uint32_t RTP_NMID = 0x08800, RTP_TILES = 0x08804, BARRIER_LOCK = 0x1f060;
 
-// The doorbell's path: shim column 7 channel 1 into memory tile column 7 channel 5, both free in the design.
+// The doorbell's path: shim column 7 channel 1 into memory tile column 7 channel 5, both free in the design, to a word at
+// the end of that tile's memory. That channel reaches no other tile's. tools/xdna/check_doorbell_word.py sees that nothing
+// the compiler allocates gets there.
 constexpr int DB_COL = 7, DB_SHIM_BD = 15, DB_MEM_BD = 47;
-constexpr uint32_t DB_MEM_ADDR = 0x70000;  // inside the memory tile, past what the design allocates
-constexpr uint32_t MEM_BD_BASE = 0xA0000, MEM_S2MM5_QUEUE = 0xA062C;
+constexpr int64_t DB_COL_AHEAD = 4 * 8192;  // blocks of weights: the depth of that column's B3 in gemm_bfp.py, times its size
+constexpr int DB_WORD_COL = 7;
+constexpr uint32_t DB_WORD_ADDR = 524032;
+constexpr uint32_t MEM_BD_BASE = 0xA0000, MEM_S2MM5_CTRL = 0xA0628, MEM_S2MM5_QUEUE = 0xA062C;
+constexpr uint32_t CHANNEL_BUSY = 0x00080003;  // of a channel's status: running, and its state
 constexpr uint32_t JOB_MARK[2] = {1u << 16, 2u << 16};  // or'd with the matmul's number in the job
 
 inline uint32_t tile_addr(int col, int row, uint32_t off) { return ((uint32_t) col << 25) | ((uint32_t) row << 20) | off; }
@@ -78,10 +88,13 @@ struct stream {
         const int64_t b_col0 = (N / COLS) * K / 8;
         std::vector<std::vector<std::pair<int, int>>> groups(rbs);
         if (doorbell != 0) {
+            const int64_t db_ahead = std::min(b_col0, DB_COL_AHEAD);
             for (int col = 0; col < COLS; col++)
-                task(groups[0], B_SHIM[col][0], b, (uint64_t) (col * b_col0 * BLOCK), (uint32_t) (b_col0 * BLOCK / 4),
+                task(groups[0], B_SHIM[col][0], b, (uint64_t) (col * b_col0 * BLOCK), (uint32_t) ((B_SHIM[col][0] == DB_COL ? db_ahead : b_col0) * BLOCK / 4),
                      B_SHIM[col][1] ? MM2S1_QUEUE : MM2S0_QUEUE, 1, false);
             doorbell_wait(doorbell);
+            if (db_ahead < b_col0)
+                task(groups[0], DB_COL, b, (uint64_t) ((COLS - 1) * b_col0 * BLOCK + db_ahead * BLOCK), (uint32_t) ((b_col0 - db_ahead) * BLOCK / 4), MM2S0_QUEUE, 1, false);
         }
         for (int row = 2; row < 2 + ROWS; row++)
             for (int col = 0; col < COLS; col++) {
@@ -106,20 +119,26 @@ struct stream {
     }
     // The doorbell: buffer descriptors that repeat themselves for ever. `mailbox` is a word of host memory.
     void doorbell_start(const place & mailbox) {
-        write32(tile_addr(DB_COL, 1, DB_MEM_ADDR), 0);
+        used[DB_COL].insert(DB_SHIM_BD);
+        const uint32_t sb = (uint32_t) DB_SHIM_BD;
+        write32(tile_addr(DB_WORD_COL, 1, DB_WORD_ADDR), 0);
         const uint32_t m = tile_addr(DB_COL, 1, MEM_BD_BASE + 0x20 * DB_MEM_BD);
-        put({1, 0, m, 48, 4, (1u << 19) | ((uint32_t) DB_MEM_BD << 20) | ((0x80000u + DB_MEM_ADDR) >> 2), 0, 0, 0, 0, 0, 0x80000000u});
+        put({1, 0, m, 48, 4, (1u << 19) | ((uint32_t) DB_MEM_BD << 20) | ((0x80000u + DB_WORD_ADDR) >> 2), 0, 0, 0, 0, 0, 0x80000000u});
         write32(tile_addr(DB_COL, 1, MEM_S2MM5_QUEUE), DB_MEM_BD);
-        const uint32_t a = tile_addr(DB_COL, 0, BD_BASE + BD_STRIDE * DB_SHIM_BD);
-        put({1, 0, a, 48, 4, (uint32_t) mailbox.off, 0, 0, 0xc0000000, 0x02000000, 0, 0x02000000u | (1u << 26) | ((uint32_t) DB_SHIM_BD << 27)});
+        const uint32_t a = tile_addr(DB_COL, 0, BD_BASE + BD_STRIDE * sb);
+        put({1, 0, a, 48, 4, (uint32_t) mailbox.off, 0, 0, 0xc0000000, 0x02000000, 0, 0x02000000u | (1u << 26) | (sb << 27)});
         put({0x81, 48, 0, 0, 0, 0, a + 4, 0, mailbox.arg, 0, (uint32_t) mailbox.off, 0});
-        write32(tile_addr(DB_COL, 0, MM2S1_QUEUE), DB_SHIM_BD);
+        write32(tile_addr(DB_COL, 0, MM2S1_QUEUE), sb);
     }
-    void doorbell_wait(uint32_t value) { poll(tile_addr(DB_COL, 1, DB_MEM_ADDR), value, 0xffffffff); }
+    void doorbell_wait(uint32_t value) { poll(tile_addr(DB_WORD_COL, 1, DB_WORD_ADDR), value, 0xffffffff); }
     void doorbell_stop() {
-        // no next descriptor: both channels finish the transfer they are in and stop
-        write32(tile_addr(DB_COL, 0, BD_BASE + BD_STRIDE * DB_SHIM_BD + 0x1c), 0x02000000u);
-        write32(tile_addr(DB_COL, 1, MEM_BD_BASE + 0x20 * DB_MEM_BD + 4), (0x80000u + DB_MEM_ADDR) >> 2);
+        // The shim's channel finishes what it is reading and stops; the memory tile's takes that in and goes on waiting for
+        // more, which only a reset ends. What is still in the stream by then is taken in by the next job, and all four words
+        // of a transfer being the same, it does not matter how many words that is.
+        write32(tile_addr(DB_COL, 0, BD_BASE + BD_STRIDE * (uint32_t) DB_SHIM_BD + 0x1c), 0x02000000u);
+        poll(tile_addr(DB_COL, 0, MM2S1_STATUS), 0, CHANNEL_BUSY);
+        write32(tile_addr(DB_COL, 1, MEM_S2MM5_CTRL), 2);
+        write32(tile_addr(DB_COL, 1, MEM_S2MM5_CTRL), 0);
     }
     std::vector<uint32_t> finish() const {
         std::vector<uint32_t> out = {0x06040100, 0x108, ops, (uint32_t) ((w.size() + 4) * 4)};

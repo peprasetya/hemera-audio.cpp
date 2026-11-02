@@ -1211,7 +1211,7 @@ public:
       : assets_(require_assets(std::move(assets))),
         weights_(std::make_shared<VoxCPM2WeightsRuntime>(
             assets_, execution_context, config.weight_context_bytes,
-            config.weight_storage_type, config.optimized)),
+            config.weight_storage_type, config.optimized, config.lm_threads)),
         tokenizer_(assets_),
         text_embedding_(weights_, config.text_embedding_graph_context_bytes,
                         config.mem_saver),
@@ -1222,9 +1222,7 @@ public:
         cfm_(weights_, config.dit_graph_context_bytes, config.mem_saver),
         local_encoder_(weights_, config.local_encoder_graph_context_bytes,
                        config.mem_saver),
-        prompt_audio_embedding_cache_(config.prompt_cache_slots) {
-    weights_->set_lm_threads(config.lm_threads);
-  }
+        prompt_audio_embedding_cache_(config.prompt_cache_slots) {}
 
   VoxCPM2Result generate_zero_shot(const std::string &text,
                                    const VoxCPM2GenerationOptions &options) {

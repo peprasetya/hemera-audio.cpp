@@ -11,7 +11,7 @@
 // shared memory before each, and the host sees a matmul has finished when a sentinel in its output is overwritten. No
 // driver call per matmul, 20 us instead of 75. All weights live in a few large buffers, because a job can name only five
 // buffers. And each matmul's weights start crossing as soon as the last one is done, into the memory tiles, so that the
-// host's work between matmuls overlaps with the transfer; next to a GPU competing for memory this is worth a third.
+// host's work between matmuls overlaps with the transfer.
 //
 // Settings, read once:
 //   GGML_XDNA=1               turn it on (--backend npu does)
@@ -391,8 +391,28 @@ struct npu {
         jobs++;
     }
 
-    // A new context, for when the NPU has stopped answering. Taking the old one down waits for its stuck job, as long as
-    // the driver's own timeout for a job. Programs and buffers stay.
+    // Does the NPU run a job? A job of a process that was killed in the middle of one waits for its doorbell until the driver's
+    // own timeout for a job, 60 s, and nothing else runs until then.
+    void check() {
+        stream st;
+        st.doorbell_start({ARG_A, 0});
+        st.doorbell_stop();
+        const auto words = st.finish();
+        xrt::bo insts(dev, words.size() * 4, XCL_BO_FLAGS_CACHEABLE, kern.group_id(1));
+        memcpy(insts.map<void *>(), words.data(), words.size() * 4);
+        insts.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+        xrt::run r(kern);
+        r.set_arg(0, 3u);
+        r.set_arg(1, insts);
+        r.set_arg(2, (unsigned) words.size());
+        r.set_arg(3 + ARG_A, a);
+        r.set_arg(3 + ARG_C, c);
+        r.start();
+        const auto state = r.wait(std::chrono::milliseconds(1000));
+        if (state != ERT_CMD_STATE_COMPLETED) throw std::runtime_error("the NPU did not run a test job: state " + std::to_string((int) state));
+    }
+
+    // A new context, for when the NPU has stopped answering. Programs and buffers stay.
     void reopen() {
         for (auto & kv : programs)
             for (segment & seg : kv.second->segments) {
@@ -418,12 +438,12 @@ struct npu {
         _mm_mfence();
         const auto t = clk::now();
         if (test_stall == 0 || --test_stall != 0) {
-            *mailbox = JOB_MARK[mark] | seq;
+            _mm_store_si128((__m128i *) const_cast<uint32_t *>(mailbox), _mm_set1_epi32((int) (JOB_MARK[mark] | seq)));
             _mm_clflush((const void *) mailbox);
             _mm_mfence();
         }
         // Most of this wait is the weights crossing, part of which has already happened: no need to keep asking until the
-        // rest should have.
+        // rest should have. (Asking means reading through the cache, every 100 ns.)
         const double expected = 0.4 * (double) (s.M / GRAIN_M) * s.Kp * s.Np * BLOCK / 8 / 57e3;
         while (us_since(t) < expected) _mm_pause();
         for (int col = 0; col < COLS; col++) {
@@ -456,6 +476,8 @@ std::unordered_set<const void *> g_no_room;
 int g_failures = 0;
 clk::time_point g_last_failure;
 
+void give_up(const std::exception & e);
+
 void trace_at_exit() {
     if (g_npu) g_npu->print_trace();
 }
@@ -482,13 +504,18 @@ void init() {
     try {
         const auto t = clk::now();
         g_npu = new npu(path);  // never freed: the driver cleans up when the process ends
-        g_on = true;
         fprintf(stderr, "xdna: NPU %s ready in %.0f ms\n", g_npu->dev.get_info<xrt::info::device::name>().c_str(), us_since(t) / 1e3);
         if (const char * v = getenv("GGML_XDNA_TRACE")) {
             atexit(trace_at_exit);
             if (atoll(v) > 1) g_npu->trace_every = atoll(v);  // also every so many calls, for a server
         }
         if (const char * v = getenv("GGML_XDNA_TEST_STALL")) g_npu->test_stall = atoll(v);
+        try {
+            g_npu->check();
+            g_on = true;
+        } catch (const std::exception & e) {
+            give_up(e);
+        }
     } catch (const std::exception & e) {
         fprintf(stderr, "xdna: no NPU, staying on the CPU: %s\n", e.what());
     }
@@ -533,27 +560,34 @@ void mul_mat_fallback(const ggml_tensor * w, const float * x, float * out, int64
     }
 }
 
-// Everything goes on on the CPU while a new context is tried in the background. Failing again and again, it stays off.
+// Everything goes on on the CPU while a new context is tried in the background, until one runs a job. The more failures of late,
+// the longer before it is used again: a failure costs the listener 2 s, the CPU only speed.
 void give_up(const std::exception & e) {
     fprintf(stderr, "xdna: the NPU failed, back to the CPU: %s\n", e.what());
     g_on = false;
     const auto now = clk::now();
     if (now - g_last_failure > std::chrono::hours(1)) g_failures = 0;
     g_last_failure = now;
-    if (++g_failures > 3) {
-        fprintf(stderr, "xdna: that was too many in an hour, staying on the CPU\n");
-        return;
-    }
-    std::thread([] {
-        std::lock_guard<std::mutex> lock(g_busy);
+    const int seconds = g_failures == 0 ? 0 : 30 << std::min(g_failures - 1, 6);
+    g_failures++;
+    std::thread([seconds] {
+        std::this_thread::sleep_for(std::chrono::seconds(seconds));
         const auto t = clk::now();
-        try {
-            g_npu->reopen();
-            g_on = true;
-            fprintf(stderr, "xdna: the NPU is back after %.1f s\n", us_since(t) / 1e6);
-        } catch (const std::exception & e2) {
-            fprintf(stderr, "xdna: the NPU stays off: %s\n", e2.what());
+        for (int attempt = 0; attempt < 30; attempt++) {
+            {
+                std::lock_guard<std::mutex> lock(g_busy);
+                try {
+                    g_npu->reopen();
+                    g_npu->check();
+                    g_on = true;
+                    fprintf(stderr, "xdna: the NPU is back after %.1f s\n", us_since(t) / 1e6);
+                    return;
+                } catch (const std::exception &) {
+                }
+            }
+            std::this_thread::sleep_for(std::chrono::seconds(10));
         }
+        fprintf(stderr, "xdna: the NPU stays off\n");
     }).detach();
 }
 
