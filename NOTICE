@@ -1,0 +1,49 @@
+hemera-audio.cpp
+================
+
+This is audio.cpp (https://github.com/0xShug0/audio.cpp), Copyright 2026 ShugoAI LLC,
+licensed under the Apache License, Version 2.0 (LICENSE), at its tag v0.9.3, with a backend
+for AMD XDNA2 NPUs added for hemera (https://github.com/peprasetya/hemera). It includes
+ggml, Copyright (c) 2023-2026 The ggml authors, under the MIT License (external/ggml/LICENSE),
+and the other libraries in external/, each under its own licence.
+
+The NPU port, 2026, by Paulus Edwin Prasetya:
+
+New files, under the MIT License (LICENSE-MIT):
+  docs/build/xdna-npu.md
+  external/ggml/src/ggml-cpu/xdna/ggml-xdna-insts.h
+  external/ggml/src/ggml-cpu/xdna/ggml-xdna.cpp
+  external/ggml/src/ggml-cpu/xdna/ggml-xdna.h
+  tools/xdna/build.sh
+  tools/xdna/check_doorbell_word.py
+  tools/xdna/check_insts.cpp
+  tools/xdna/gemm_bfp.py
+  tools/xdna/mm_bfp_f32.cc
+  tools/xdna/test_mul_mat.cpp
+  tools/xdna/test_short_k.cpp
+
+Changed audio.cpp files, under audio.cpp's licence (Apache-2.0); each says at its top that
+it was changed:
+  CMakeLists.txt
+  app/cli/args.cpp
+  app/cli/main.cpp
+  app/server/main.cpp
+  include/engine/framework/core/module.h
+  include/engine/models/voxcpm2/audiovae.h
+  include/engine/models/voxcpm2/generator.h
+  include/engine/models/voxcpm2/minicpm.h
+  include/engine/models/voxcpm2/types.h
+  src/models/voxcpm2/audiovae.cpp
+  src/models/voxcpm2/generator.cpp
+  src/models/voxcpm2/loader.cpp
+  src/models/voxcpm2/minicpm.cpp
+  src/models/voxcpm2/minicpm_blocks.h
+  src/models/voxcpm2/session.cpp
+  README.md
+
+Changed ggml files, under ggml's licence (MIT):
+  external/ggml/src/ggml-cpu/CMakeLists.txt
+  external/ggml/src/ggml-cpu/ggml-cpu.c
+  external/ggml/src/ggml-cpu/ops.cpp
+
+Every change is in the history of this branch, npu-xdna: `git diff v0.9.3`.

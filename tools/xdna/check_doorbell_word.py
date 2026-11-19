@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 Paulus Edwin Prasetya (hemera-audio.cpp, the AMD XDNA2 NPU port)
 """The doorbell's word must lie past everything the compiler put in its memory tile.
 usage: check_doorbell_word.py <input_with_addresses.mlir> <ggml-xdna-insts.h>"""
 import re

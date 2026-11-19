@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 Paulus Edwin Prasetya (hemera-audio.cpp, the AMD XDNA2 NPU port)
 # Whole-array bfp16 x bfp16 -> fp32 matmul for small-batch workloads: C[M x N] = A[M x K] * B[N x K]^T.
 # Structure follows mlir-aie programming_examples/basic/matrix_multiplication/whole_array
 # (Copyright AMD, Apache-2.0 WITH LLVM-exception).

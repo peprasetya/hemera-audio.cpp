@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 Paulus Edwin Prasetya (hemera-audio.cpp, the AMD XDNA2 NPU port)
 // Matrix multiplies on the AMD XDNA2 NPU (Strix, Strix Halo, Krackan), from inside the CPU backend.
 // Set GGML_XDNA=1 to turn it on (--backend npu does). See ggml-xdna.cpp.
 #pragma once

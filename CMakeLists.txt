@@ -1,3 +1,4 @@
+# Changed in hemera-audio.cpp (2026) for the AMD XDNA2 NPU port; see NOTICE.
 cmake_minimum_required(VERSION 3.20)
 
 project(AudioCpp LANGUAGES C CXX)

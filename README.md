@@ -1,3 +1,23 @@
+# hemera-audio.cpp
+
+This is [audio.cpp](https://github.com/0xShug0/audio.cpp) v0.9.3 with one addition: its large
+matrix multiplies can run on the **NPU** of AMD's Ryzen AI chips (XDNA2: Strix, Strix Halo,
+Krackan). Speech can then be made without the GPU, beside an LLM that keeps it.
+[hemera](https://github.com/peprasetya/hemera) runs it as the `audio.cpp-npu` engine
+(`--backend npu`), next to the ordinary Vulkan build.
+
+- **Building and using it**, and what it measured: [docs/build/xdna-npu.md](docs/build/xdna-npu.md).
+- **What changed:** `git diff v0.9.3` on this branch, `npu-xdna`.
+- **Licences:**
+  - audio.cpp is Apache-2.0 ([LICENSE](LICENSE)), and stays so, changes included;
+  - ggml is MIT;
+  - the NPU port's new files are MIT ([LICENSE-MIT](LICENSE-MIT));
+  - [NOTICE](NOTICE) says which file is which.
+
+The rest of this page is audio.cpp's own README.
+
+---
+
 # audio.cpp
 <a href="https://trendshift.io/repositories/64983?utm_source=repository-badge&amp;utm_medium=badge&amp;utm_campaign=badge-repository-64983" target="_blank" rel="noopener noreferrer"><img src="https://trendshift.io/api/badge/repositories/64983" alt="0xShug0%2Faudio.cpp | Trendshift" width="250" height="55"/></a>
 [![0xShug0/audio.cpp | Trendshift](https://trendshift.io/api/badge/trendshift/repositories/64983/daily?language=C%2B%2B)](https://trendshift.io/repositories/64983?utm_source=trendshift-badge&utm_medium=badge&utm_campaign=badge-trendshift-64983)

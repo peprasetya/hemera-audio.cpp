@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 Paulus Edwin Prasetya (hemera-audio.cpp, the AMD XDNA2 NPU port)
 // The NPU instruction stream for the matmul in tools/xdna/gemm_bfp.py, generated on the host.
 // tools/xdna/check_insts.cpp compares a single matmul with what the IRON compiler produces, word for word.
 //

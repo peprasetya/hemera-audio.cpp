@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 Paulus Edwin Prasetya (hemera-audio.cpp, the AMD XDNA2 NPU port)
 // The multiply for short K in ggml_compute_forward_mul_mat against the plain formula, with batches and broadcast.
 #include "ggml.h"
 #include "ggml-alloc.h"

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 Paulus Edwin Prasetya (hemera-audio.cpp, the AMD XDNA2 NPU port)
 // Matrix multiplies on the AMD XDNA2 NPU, from inside the CPU backend.
 //
 // The NPU is good at one thing here: C[M x N] = A[M x K] * W[N x K]^T where W is a constant weight matrix. The core

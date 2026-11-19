@@ -1,4 +1,6 @@
 #!/bin/bash
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 Paulus Edwin Prasetya (hemera-audio.cpp, the AMD XDNA2 NPU port)
 # Builds the NPU core program and checks the host's instruction generator against the IRON compiler.
 # usage: tools/xdna/build.sh <output dir>
 # Needs IRON (mlir-aie with the Peano compiler) active in the environment; see docs/build/xdna-npu.md.

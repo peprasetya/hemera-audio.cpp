@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 Paulus Edwin Prasetya (hemera-audio.cpp, the AMD XDNA2 NPU port)
 // The NPU path against the exact product, over shapes that need padding, large batches and both kinds of
 // weight, in mixed order. Run with GGML_XDNA=1 GGML_XDNA_FORCE=1. Exit code 0 when every shape is within
 // tolerance. usage: test_mul_mat <rounds>

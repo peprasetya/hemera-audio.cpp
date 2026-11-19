@@ -1,3 +1,4 @@
+// Changed in hemera-audio.cpp (2026) for the AMD XDNA2 NPU port; see NOTICE.
 #include "engine/models/voxcpm2/generator.h"
 
 #include "minicpm_blocks.h"

@@ -181,3 +181,7 @@ These also speed up plain `--backend cpu`. All but the short-K multiply give bit
 - Only tested on Strix Halo. Other XDNA2 chips have the same array and should work.
 - First-generation XDNA (Phoenix, Hawk Point) is a different array and is not supported by this core program.
 - Two processes can share the NPU, but a job holds it for the length of a graph: the other waits.
+
+---
+
+This document, like the NPU port's other new files, is MIT ([LICENSE-MIT](../../LICENSE-MIT)); see [NOTICE](../../NOTICE).

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 Paulus Edwin Prasetya (hemera-audio.cpp, the AMD XDNA2 NPU port)
 // Compares the host-side instruction generator with what the IRON compiler produced for the same shape.
 // usage: check_insts <insts.bin> <M> <K> <N> ...
 #include "ggml-xdna-insts.h"

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 Paulus Edwin Prasetya (hemera-audio.cpp, the AMD XDNA2 NPU port)
 // bfp16ebs8 x bfp16ebs8 -> float32 matmul tile for AIE2P, for the whole-array design in gemm_bfp.py.
 // Based on mlir-aie aie_kernels/linalg/mm_bfp.cc (Apache-2.0 WITH LLVM-exception).
 //

@@ -1,3 +1,4 @@
+// Changed in hemera-audio.cpp (2026) for the AMD XDNA2 NPU port; see NOTICE.
 #pragma once
 
 #include "engine/framework/assets/tensor_source.h"
